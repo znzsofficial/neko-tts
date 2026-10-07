@@ -165,9 +165,7 @@ class SpeechEngine:
                     endpoint += '/chat/completions'
                 preset = mimo['synthesis_mode'] == 'preset'
                 voice = mimo['preset_voice'] if preset else await self.reference(config)
-                prompt = config['voice']['clone_prompt'].strip()
-                if style.strip():
-                    prompt += '\n本次表达方式：' + style.strip()
+                prompt = self._build_prompt(config['voice']['clone_prompt'], style)
                 if not self.session:
                     self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=config['general']['timeout']))
                 audios = []
@@ -190,6 +188,18 @@ class SpeechEngine:
                 if len(audios) == 1:
                     return audios[0]
                 return await self.merge(audios, config)
+
+    @staticmethod
+    def _build_prompt(base, style):
+        base = base.strip()
+        style = style.strip()
+        return '\n'.join(part for part in (
+            '自然朗读正文，保持所选音色。声音要求只用于表达，不作为朗读内容。',
+            '不要添加、删除、改写或解释正文。',
+            f'基础声音要求：{base}' if base else '',
+            '本轮声音要求（与基础语气冲突时，以本轮为准；未指定项保持自然）：',
+            style or '情绪自然；语速适中；音量正常；停顿自然；表演克制。',
+        ) if part)
 
     async def merge(self, audios, config):
         # Real decoding/encoding, never concatenate MP3/WAV bytes directly.

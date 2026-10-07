@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- 统一 MiMo 合成提示模板，区分基础要求和本轮语气优先级，补充自然朗读默认值。
+- 引导 Planner 用具体的情绪、语速、音量、停顿和表演程度描述 style。
+
 ## 0.3.0
 
 - 增加可选 `text_and_voice` / `voice_only` 输出模式。

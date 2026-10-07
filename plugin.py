@@ -130,7 +130,10 @@ class NekoTTS(MaiBotPlugin):
                      "保留原文字和附件，另发独立语音；参数仅本次生效。"),
         parameters={"type": "object", "properties": {
             "style": {"type": "string", "maxLength": 240, "default": "",
-                      "description": "本次语气、情绪或节奏，如轻声温柔、开心俏皮；不作为朗读正文。"}},
+                      "description": ("仅本轮声音表达，不是朗读正文。用简短、具体且一致的描述，"
+                                      "可按情绪、语速、音量、停顿、表演程度组织；无需全部填写。"
+                                      "例如：情绪温柔安慰；语速稍慢；音量偏低；自然短停顿；表演克制。"
+                                      "避免只写可爱一点、有感情，不要求改写正文。")}},
             "additionalProperties": False},
         priority=20, timeout_ms=240000,
     )

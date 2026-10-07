@@ -32,6 +32,8 @@ git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
 
 ## 合成配置
 
+本轮 `style` 建议具体描述声音，例如“情绪温柔安慰；语速稍慢；音量偏低；自然短停顿；表演克制”。不要求填齐各项。插件将基础提示与本轮要求分区，明确本轮语气优先、未指定项保持自然；未传 style 时使用自然朗读默认值。提示放在 MiMo 的 user 消息，朗读正文独立放在 assistant 消息。实际情绪表现仍需试听确认。
+
 - `mimo.synthesis_mode=voiceclone`：使用目录内一段参考音频，`preferred_reference_file` 可固定文件名。
 - 自动选择：最多分析32个文件、每文件前60秒，根据有效有声时长选一段；不是说话人识别或主观音质评分。统一单声道 WAV，裁首尾静音并限制长度，保留片段内停顿。原始文件不修改；参考仅缓存内存。
 - `mimo.synthesis_mode=preset`：无需参考音频。音色支持冰糖、茉莉、苏打、白桦、Mia、Chloe、Milo、Dean、mimo_default。
