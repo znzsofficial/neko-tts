@@ -60,6 +60,33 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.p._render.assert_awaited_once_with('你好', '轻声')
         self.p.ctx.send.custom.assert_not_called()
 
+    async def test_voice_only_drops_text_but_keeps_one_voice(self):
+        self.p.config.output.mode = 'voice_only'
+        result = await self.p.voice_reply_extension(phase='before_send', messages=self.messages)
+        self.assertEqual(len(result['messages']), 1)
+        self.assertEqual(result['messages'][0]['segments'][0]['type'], 'voice')
+
+    async def test_text_then_voice_registers_without_synthesizing(self):
+        self.p.config.output.mode = 'text_then_voice'
+        result = await self.p.voice_reply_extension(phase='before_send',
+                                                    session_id='chat-a', messages=self.messages,
+                                                    parameters={'style': '轻声'})
+        self.assertEqual(result['messages'], self.messages)
+        self.p._render.assert_not_called()
+        self.assertEqual(self.p._pending['chat-a'][0][1], '轻声')
+
+    async def test_text_then_voice_starts_only_after_matching_send(self):
+        self.p.config.output.mode = 'text_then_voice'
+        self.p._pending['chat-a'] = [('你好', '开心', 9999999999)]
+        self.p._background_voice = AsyncMock()
+        await self.p.after_text_send(
+            message={'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': '你好'}]},
+            sent=True,
+        )
+        await asyncio.sleep(0)
+        self.p._background_voice.assert_awaited_once_with('你好', '开心', 'chat-a')
+        self.assertNotIn('chat-a', self.p._pending)
+
     async def test_failure_preserves_original(self):
         self.p._render.side_effect = RuntimeError('network')
         self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=self.messages), {})

@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "0.2.0"
+config_version = "0.3.0"
 
 [general]
 timeout = 120
@@ -8,9 +8,14 @@ max_text_length = 500
 max_total_length = 2000
 max_segments = 8
 
+[output]
+# text_and_voice：文字和语音同批发送；text_then_voice：文字先发，成功后后台补语音；voice_only：本轮只发送语音
+mode = "text_and_voice"
+
 [voice]
 voice_dir = ""
 preferred_reference_file = ""
+reference_strategy = "best_single"
 clone_prompt = "保持参考音频中的音色、年龄感和说话节奏。自然、清晰、松弛地说话，不要夸张表演，不要添加额外语气词。"
 sample_rate = 24000
 max_clip_duration = 15.0

@@ -123,15 +123,33 @@ class SpeechEngine:
         if not candidates:
             raise ValueError('参考音频无有效有声片段或无法解码')
         _, path, start, duration = max(candidates, key=lambda value: value[0])
-        data, _ = await run(binary, '-v', 'error', '-ss', start, '-i', path, '-t',
+        if voice['reference_strategy'] == 'best_single':
+            data, _ = await run(binary, '-v', 'error', '-ss', start, '-i', path, '-t',
                             min(duration, voice['max_clip_duration']), '-vn', '-ac', '1',
                             '-ar', voice['sample_rate'], '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1')
+        else:
+            data = await self._merge_reference(files, voice, binary)
         encoded = base64.b64encode(data).decode('ascii')
         if len(data) < 1000 or len(encoded) > 9_500_000:
             raise ValueError('参考音频大小不合适')
         self.reference_key = key
         self.reference_uri = 'data:audio/wav;base64,' + encoded
         return self.reference_uri
+
+    async def _merge_reference(self, files, voice, binary):
+        """Decode each source, normalize it, then concatenate PCM via FFmpeg."""
+        with tempfile.TemporaryDirectory(prefix='neko-reference-', dir=self.root) as directory:
+            output = Path(directory) / 'reference.wav'
+            args = [binary, '-v', 'error', '-y']
+            for path in files[:32]:
+                args.extend(['-t', str(voice['max_clip_duration']) if voice['reference_strategy'] == 'balanced' else '99999', '-i', str(path)])
+            filters = []
+            for index in range(len(files[:32])):
+                filters.append(f'[{index}:a:0]aformat=sample_fmts=s16:sample_rates={voice["sample_rate"]}:channel_layouts=mono[a{index}]')
+            filters.append(''.join(f'[a{i}]' for i in range(len(files[:32]))) + f'concat=n={len(files[:32])}:v=0:a=1[out]')
+            args.extend(['-filter_complex', ';'.join(filters), '-map', '[out]', '-t', str(voice['max_clip_duration']), '-c:a', 'pcm_s16le', '-f', 'wav', output])
+            await run(*args)
+            return output.read_bytes()
 
     async def render(self, chunks, style, config):
         async with asyncio.timeout(config['general']['timeout']):

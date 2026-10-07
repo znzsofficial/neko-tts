@@ -28,13 +28,15 @@ git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
 
 在宿主发送前完成合成，把一条独立语音追加到原文字和图片之后，再由宿主按顺序发送。**不是文字已经发出才开始合成**，因此选择语音会增加本轮发送等待时间。文字引用与附件保留，语音不带引用，避免 QQ 不投递“引用＋语音”的组合。
 
-合成出错或超出长度限制，返回原回复给宿主发送，日志只记录错误类型。宿主发送阶段的网络失败由宿主处理；不能保证 QQ 已投递。不会自动重试付费合成或重复发送。插件卸载/配置重载会取消本插件的合成任务。
+合成出错或超出长度限制，返回原回复给宿主发送，日志只记录错误类型。宿主发送阶段的网络失败由宿主处理；不能保证 QQ 已投递。`text_then_voice` 只在文字发送成功后启动一次后台合成，合成失败不影响文字；后台任务不自动重试付费请求，也不重复发送。插件卸载/配置重载会取消本插件的合成任务。
 
 ## 合成配置
 
 - `mimo.synthesis_mode=voiceclone`：使用目录内一段参考音频，`preferred_reference_file` 可固定文件名。
 - 自动选择：最多分析32个文件、每文件前60秒，根据有效有声时长选一段；不是说话人识别或主观音质评分。统一单声道 WAV，裁首尾静音并限制长度，保留片段内停顿。原始文件不修改；参考仅缓存内存。
 - `mimo.synthesis_mode=preset`：无需参考音频。音色支持冰糖、茉莉、苏打、白桦、Mia、Chloe、Milo、Dean、mimo_default。
+- `output.mode=text_and_voice` 先合成再同批发送；`text_then_voice` 先发送文字，确认平台接受后在后台合成并补发语音；`voice_only` 本轮只发送语音。合成失败仍保留原文字，避免丢回复。
+- `voice.reference_strategy=best_single` 使用最佳单段；`balanced` 截取每段最多 `max_clip_duration` 后拼接；`full_merge` 使用全部参考音频后拼接。三种模式都会统一成单声道 WAV，最终长度受 `max_clip_duration` 限制。你的参考音频已人工修整时可使用 `full_merge`，但各段音色、距离和噪声仍应尽量一致。
 - 模型分别为 `mimo-v2.5-tts-voiceclone` 和 `mimo-v2.5-tts`，鉴权为 `api-key`。
 - `general.max_text_length` 是每段上限，按标点切分，长句必要时硬切但不丢字。总长超过 `max_total_length` 或段数超过 `max_segments` 时保留文字，不悄悄截断。
 - 多段按顺序合成，再经 FFmpeg 解码合并为一条 WAV，避免连发多条或直接拼接文件字节。临时文件用后清理。
