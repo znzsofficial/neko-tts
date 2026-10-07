@@ -1,0 +1,24 @@
+[plugin]
+enabled = false
+config_version = "0.1.0"
+
+[general]
+timeout = 120
+max_text_length = 500
+
+[voice]
+voice_dir = ""
+preferred_reference_file = ""
+clone_prompt = "保持参考音频中的音色、年龄感和说话节奏。自然、清晰、松弛地说话，不要夸张表演，不要添加额外语气词。"
+sample_rate = 24000
+max_clip_duration = 15.0
+ffmpeg_path = ""
+
+[mimo]
+api_key = ""
+api_base_url = "https://api.xiaomimimo.com/v1"
+model = "mimo-v2.5-tts-voiceclone"
+audio_format = "mp3"
+
+[command]
+allowed_user_ids = []
