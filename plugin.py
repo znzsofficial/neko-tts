@@ -20,7 +20,7 @@ except ImportError:
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.2.0")
+    config_version: str = Field(default="0.4.0")
 
 
 class GeneralConfig(PluginConfigBase):

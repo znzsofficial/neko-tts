@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "neko.tts",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "name": "Neko TTS",
   "description": "Planner 主动选择是否发送 MiMo 语音，并控制当前回复语气。",
   "author": { "name": "NekoLaska", "url": "https://github.com/znzsofficial" },
