@@ -13,6 +13,39 @@ from urllib.parse import urlparse
 import aiohttp
 
 
+class SpeechError(RuntimeError):
+    """Safe diagnostic text: never contains provider content or credentials."""
+
+
+def decode_response(raw):
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise SpeechError('MiMo invalid_json') from None
+    choices = payload.get('choices') if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise SpeechError('MiMo missing_choices')
+    choice = choices[0]
+    reason = choice.get('finish_reason')
+    reason = reason if reason in {'stop', 'length', 'content_filter', 'error'} else 'unknown'
+    if reason == 'content_filter':
+        raise SpeechError('MiMo content_filter')
+    if reason == 'length':
+        raise SpeechError('MiMo truncated_audio')
+    message = choice.get('message')
+    audio = message.get('audio') if isinstance(message, dict) else None
+    data = audio.get('data') if isinstance(audio, dict) else None
+    if not isinstance(data, str) or not data:
+        raise SpeechError(f'MiMo missing_audio finish_reason={reason}')
+    try:
+        decoded = base64.b64decode(data, validate=True)
+    except ValueError:
+        raise SpeechError('MiMo invalid_audio_base64') from None
+    if len(decoded) < 100 or not (decoded.startswith((b'RIFF', b'ID3')) or decoded[0] == 255):
+        raise SpeechError('MiMo unsupported_audio')
+    return decoded
+
+
 def split_text(text, config):
     text = re.sub(r'```[\s\S]*?```', '', text)
     text = re.sub(r'\[([^\]]+)\]\(https?://[^)]+\)', r'\1', text)
@@ -173,21 +206,37 @@ class SpeechEngine:
                     body = {'model': 'mimo-v2.5-tts' if preset else mimo['model'],
                             'messages': [{'role': 'user', 'content': prompt}, {'role': 'assistant', 'content': chunk}],
                             'audio': {'format': mimo['audio_format'], 'voice': voice}}
-                    async with self.session.post(endpoint, json=body, headers={'api-key': mimo['api_key']}, allow_redirects=False) as response:
-                        if response.status != 200:
-                            raise RuntimeError(f'MiMo HTTP {response.status}')
-                        raw = bytearray()
-                        async for block in response.content.iter_chunked(65536):
-                            raw.extend(block)
-                            if len(raw) > 24 * 1024 * 1024:
-                                raise ValueError('合成响应过大')
-                    audio = base64.b64decode(json.loads(raw)['choices'][0]['message']['audio']['data'], validate=True)
-                    if len(audio) < 100 or not (audio.startswith((b'RIFF', b'ID3')) or audio[0] == 255):
-                        raise ValueError('合成响应不是支持的音频')
-                    audios.append(audio)
+                    audios.append(await self._request_audio(endpoint, body, mimo['api_key']))
                 if len(audios) == 1:
                     return audios[0]
                 return await self.merge(audios, config)
+
+    async def _request_audio(self, endpoint, body, api_key):
+        # Retry transient HTTP failures and one empty successful result only.
+        # Never retry a content rejection or an ambiguous network timeout.
+        for attempt in range(3):
+            async with self.session.post(endpoint, json=body, headers={'api-key': api_key}, allow_redirects=False) as response:
+                status = response.status
+                if status == 200:
+                    raw = bytearray()
+                    async for block in response.content.iter_chunked(65536):
+                        raw.extend(block)
+                        if len(raw) > 24 * 1024 * 1024:
+                            raise SpeechError('MiMo response_too_large')
+                    try:
+                        return decode_response(raw)
+                    except SpeechError as exc:
+                        if str(exc) != 'MiMo missing_audio finish_reason=stop' or attempt != 0:
+                            raise
+                elif status not in {429, 502, 503, 504} or attempt == 2:
+                    raise SpeechError(f'MiMo HTTP {status}')
+                delay = 2 ** (attempt + 1)
+                retry_after = response.headers.get('Retry-After', '')
+                if retry_after.isdigit():
+                    delay = max(delay, int(retry_after))
+                if delay > 30:
+                    raise SpeechError(f'MiMo HTTP {status} retry_after_too_long')
+            await asyncio.sleep(delay)
 
     @staticmethod
     def _build_prompt(base, style):

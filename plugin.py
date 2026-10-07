@@ -13,9 +13,9 @@ from maibot_sdk import (CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler,
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 try:
-    from .audio import SpeechEngine, split_text, voice_message
+    from .audio import SpeechEngine, SpeechError, split_text, voice_message
 except ImportError:
-    from audio import SpeechEngine, split_text, voice_message
+    from audio import SpeechEngine, SpeechError, split_text, voice_message
 
 
 class PluginSection(PluginConfigBase):
@@ -164,7 +164,7 @@ class NekoTTS(MaiBotPlugin):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.ctx.logger.warning("Neko TTS 合成失败，保留原回复：%s", type(exc).__name__)
+            self.ctx.logger.warning("Neko TTS 合成失败，保留原回复：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
             return {}
 
     @HookHandler("send_service.after_send", name="neko_tts_after_send", mode=HookMode.BLOCKING,
@@ -201,15 +201,17 @@ class NekoTTS(MaiBotPlugin):
     async def _background_voice(self, text: str, style: str, stream_id: str) -> None:
         try:
             audio = await self._render(text, style)
-            await self.ctx.send.custom(
+            sent = await self.ctx.send.custom(
                 "voice", base64.b64encode(audio).decode("ascii"), stream_id,
                 processed_plain_text=text, sync_to_maisaka_history=False,
                 maisaka_source_kind="neko_tts",
             )
+            if not sent:
+                self.ctx.logger.warning("Neko TTS 后台语音发送失败：平台未确认成功")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.ctx.logger.warning("Neko TTS 后台补发失败，文字已保留：%s", type(exc).__name__)
+            self.ctx.logger.warning("Neko TTS 后台补发失败，文字已保留：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
 
     @Command("neko_tts_cmd", description="测试语音：/neko-tts <文本>；/neko-tts status 查看模式",
              pattern=r"^/neko-tts(?:\s+(?P<text>[\s\S]+))?$")
@@ -234,7 +236,7 @@ class NekoTTS(MaiBotPlugin):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.ctx.logger.warning("Neko TTS 测试失败：%s", type(exc).__name__)
+            self.ctx.logger.warning("Neko TTS 测试失败：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
             return False, "语音合成失败，请检查配置和服务状态。", True
 
 
