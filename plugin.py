@@ -1,58 +1,55 @@
-"""Neko TTS: voice is an explicit Planner choice for the current reply only."""
+"""Neko TTS — per-reply opt-in speech, without chat-scoped intent state."""
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import json
-import re
-import shutil
-import subprocess
-import time
-import uuid
-from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from copy import deepcopy
+from typing import Any, Literal
 
-import aiohttp
-from maibot_sdk import (CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler,
-                        MaiBotPlugin, PluginConfigBase, Tool)
-from maibot_sdk.types import (ErrorPolicy, HookMode, HookOrder,
-                              ToolParameterInfo, ToolParamType)
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, MaiBotPlugin, PluginConfigBase, ReplyExtension
+
+try:
+    from .audio import SpeechEngine, split_text, voice_message
+except ImportError:
+    from audio import SpeechEngine, split_text, voice_message
 
 
-class PluginConfig(PluginConfigBase):
-    enabled: bool = Field(default=False, description="启用 Neko TTS")
-    config_version: str = Field(default="0.1.0", description="配置版本")
+class PluginSection(PluginConfigBase):
+    enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
+    config_version: str = Field(default="0.2.0")
 
 
 class GeneralConfig(PluginConfigBase):
-    timeout: int = Field(default=120, ge=5, le=300)
-    max_text_length: int = Field(default=500, ge=1, le=2000)
+    timeout: int = Field(default=120, ge=5, le=180, description="整条回复合成期限（含排队）")
+    max_text_length: int = Field(default=500, ge=50, le=2000, description="每段最大字符数；按句分段，不截断")
+    max_total_length: int = Field(default=2000, ge=50, le=6000, description="总长度上限；超过则保留文字")
+    max_segments: int = Field(default=8, ge=1, le=12, description="分段上限；超过则保留文字")
 
 
 class VoiceConfig(PluginConfigBase):
-    voice_dir: str = Field(default="", description="参考音频目录")
-    preferred_reference_file: str = Field(default="", description="固定参考音频文件名")
-    clone_prompt: str = Field(default="保持参考音频中的音色、年龄感和说话节奏。自然、清晰、松弛地说话，不要夸张表演，不要添加额外语气词。")
-    sample_rate: int = Field(default=24000, ge=8000, le=48000)
+    voice_dir: str = Field(default="", description="参考音频目录；预置音色不使用")
+    preferred_reference_file: str = Field(default="", description="固定单个参考文件名；空时自动选择有效有声时长较长的一段")
+    clone_prompt: str = Field(default="保持参考音色，自然清晰地说话。", description="基础合成提示；本轮 style 追加于其后")
+    sample_rate: Literal[16000, 24000, 44100, 48000] = 24000
     max_clip_duration: float = Field(default=15.0, ge=3.0, le=30.0)
-    ffmpeg_path: str = Field(default="")
+    ffmpeg_path: str = Field(default="", description="FFmpeg 路径；空时从 PATH 查找")
 
 
 class MimoConfig(PluginConfigBase):
-    api_key: str = Field(default="")
+    api_key: str = Field(default="", description="MiMo API Key，仅存放于本机配置")
     api_base_url: str = Field(default="https://api.xiaomimimo.com/v1")
-    model: str = Field(default="mimo-v2.5-tts-voiceclone")
-    audio_format: str = Field(default="mp3")
+    synthesis_mode: Literal["voiceclone", "preset"] = "voiceclone"
+    model: str = Field(default="mimo-v2.5-tts-voiceclone", description="克隆模型；预置模式固定使用 mimo-v2.5-tts")
+    preset_voice: Literal["冰糖", "茉莉", "苏打", "白桦", "Mia", "Chloe", "Milo", "Dean", "mimo_default"] = "冰糖"
+    audio_format: Literal["mp3", "wav"] = "mp3"
 
 
 class CommandConfig(PluginConfigBase):
-    allowed_user_ids: List[str] = Field(default_factory=list)
+    allowed_user_ids: list[str] = Field(default_factory=list, description="/neko-tts 测试命令白名单；空表示不开放")
 
 
 class Config(PluginConfigBase):
-    plugin: PluginConfig = Field(default_factory=PluginConfig)
+    plugin: PluginSection = Field(default_factory=PluginSection)
     general: GeneralConfig = Field(default_factory=GeneralConfig)
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     mimo: MimoConfig = Field(default_factory=MimoConfig)
@@ -62,181 +59,112 @@ class Config(PluginConfigBase):
 class NekoTTS(MaiBotPlugin):
     config_model = Config
 
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
-        self._session: Optional[aiohttp.ClientSession] = None
-        self._reference_uri = ""
-        self._reference_signature = ""
-        self._reference_lock = asyncio.Lock()
-        self._synthesis_lock = asyncio.Lock()
-        self._voice_intents: dict[str, tuple[float, str]] = {}
+        self._engine = None
+        self._tasks = set()
+        self._generation = 0
+        self._ready = False
 
-    async def on_load(self) -> None:
-        if not self.config.plugin.enabled:
-            self.ctx.logger.info("Neko TTS 已禁用")
-            return
-        self.ctx.logger.info("Neko TTS 已加载：Planner 主动选择语音")
+    async def on_load(self):
+        self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
+        self._ready = True
+        self.ctx.logger.info("Neko TTS 已加载：按 reply 主动选择语音")
 
-    async def on_unload(self) -> None:
-        await self._close_session()
-        self._voice_intents.clear()
-        self._reference_uri = ""
-        self._reference_signature = ""
+    async def _reset(self):
+        self._ready = False
+        self._generation += 1
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        if self._engine:
+            await self._engine.close()
 
-    async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
-        del config_data, version
-        if scope != CONFIG_RELOAD_SCOPE_SELF:
-            return
-        async with self._synthesis_lock:
-            await self._close_session()
-            self._reference_uri = ""
-            self._reference_signature = ""
-            self._voice_intents.clear()
+    async def on_unload(self):
+        await self._reset()
 
-    async def _close_session(self) -> None:
-        if self._session is not None and not self._session.closed:
-            await self._session.close()
-        self._session = None
+    async def on_config_update(self, scope, config_data, version):
+        if scope == CONFIG_RELOAD_SCOPE_SELF:
+            await self._reset()
+            self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
+            self._ready = True
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.config.general.timeout)
-            )
-        return self._session
-
-    def _audio_files(self) -> list[Path]:
-        root = Path(self.config.voice.voice_dir.strip()).expanduser()
-        if not root.is_dir():
-            raise ValueError(f"参考音频目录不存在：{root}")
-        files = sorted(
-            p for p in root.iterdir()
-            if p.is_file() and p.suffix.lower() in {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus"}
-        )
-        if not files:
-            raise ValueError("参考音频目录没有可用音频")
-        preferred = self.config.voice.preferred_reference_file.strip()
-        if preferred:
-            selected = root / preferred
-            if not selected.is_file():
-                raise ValueError(f"指定参考音频不存在：{selected}")
-            return [selected]
-        return files
-
-    def _ffmpeg(self) -> str:
-        path = self.config.voice.ffmpeg_path.strip() or shutil.which("ffmpeg")
-        if not path:
-            raise RuntimeError("未找到 ffmpeg，无法准备参考音频")
-        return path
-
-    async def _ensure_reference_uri(self) -> str:
-        async with self._reference_lock:
-            files = self._audio_files()
-            signature = "|".join(f"{p}:{p.stat().st_size}:{p.stat().st_mtime_ns}" for p in files)
-            signature += f"|{self.config.voice.preferred_reference_file}|{self.config.voice.max_clip_duration}|{self.config.voice.sample_rate}"
-            digest = hashlib.sha256(signature.encode()).hexdigest()
-            if self._reference_uri and digest == self._reference_signature:
-                return self._reference_uri
-            assert self.ctx.paths.runtime_dir is not None
-            output = self.ctx.paths.runtime_dir / f"neko-reference-{digest}.wav"
-            if not output.exists():
-                selected = files[0]
-                command = [self._ffmpeg(), "-y", "-i", str(selected), "-vn",
-                           "-af", "silenceremove=start_periods=1:start_duration=0.15:start_threshold=-45dB:stop_periods=1:stop_duration=0.35:stop_threshold=-45dB",
-                           "-t", str(self.config.voice.max_clip_duration), "-ac", "1",
-                           "-ar", str(self.config.voice.sample_rate), "-c:a", "pcm_s16le", str(output)]
-                await asyncio.to_thread(subprocess.run, command, check=True,
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                        timeout=60)
-            data = await asyncio.to_thread(output.read_bytes)
-            if len(data) < 1000:
-                raise RuntimeError("参考音频过短")
-            if len(data) > 9 * 1024 * 1024:
-                raise RuntimeError("参考音频超过 MiMo 安全大小上限")
-            self._reference_uri = "data:audio/wav;base64," + base64.b64encode(data).decode("ascii")
-            self._reference_signature = digest
-            return self._reference_uri
-
-    def _endpoint(self) -> str:
-        base = self.config.mimo.api_base_url.strip().rstrip("/")
-        return base if base.endswith("/chat/completions") else base + "/chat/completions"
-
-    def _clean_text(self, text: str) -> str:
-        text = re.sub(r"https?://\S+", "", text)
-        text = re.sub(r"\[CQ:[^\]]+\]", "", text)
-        return text.strip()[: self.config.general.max_text_length]
-
-    async def _synthesize(self, text: str, style: str) -> bytes:
-        clean = self._clean_text(text)
-        if not clean:
-            raise ValueError("没有可朗读文本")
-        if not self.config.mimo.api_key.strip():
-            raise ValueError("未配置 MiMo API Key")
-        async with self._synthesis_lock:
-            prompt = style.strip() or self.config.voice.clone_prompt.strip()
-            body = {
-                "model": self.config.mimo.model.strip() or "mimo-v2.5-tts-voiceclone",
-                "messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": clean}],
-                "audio": {"format": self.config.mimo.audio_format, "voice": await self._ensure_reference_uri()},
-            }
-            session = await self._get_session()
-            async with session.post(self._endpoint(), json=body, headers={"api-key": self.config.mimo.api_key, "Content-Type": "application/json"}) as response:
-                raw = await response.text()
-                if response.status != 200:
-                    raise RuntimeError(f"MiMo API HTTP {response.status}: {raw[:500]}")
-            data = json.loads(raw)["choices"][0]["message"]["audio"]["data"]
-            audio = base64.b64decode(data, validate=True)
-            if len(audio) < 100:
-                raise RuntimeError("MiMo 返回音频过短")
-            return audio
-
-    @HookHandler("maisaka.planner.before_request", name="neko_tts_planner_mode", mode=HookMode.BLOCKING,
-                 order=HookOrder.LATE, error_policy=ErrorPolicy.SKIP)
-    async def planner_hint(self, **kwargs: Any) -> Dict[str, Any]:
-        instruction = ("本轮默认只发文字。若你觉得这条回复适合用语音表达，主动调用 neko_voice_reply，"
-                       "可填写语气提示；调用后再调用 reply。若不想发语音，直接调用 reply。"
-                       "不要为了完成任务而调用语音工具。")
-        items = kwargs.get("items")
-        if isinstance(items, list) and not any(p.get("text") == instruction for i in items if isinstance(i, dict) for p in i.get("parts", []) if isinstance(p, dict)):
-            items.append({"item_type": "SystemMessageItem", "meta": {"item_id": uuid.uuid4().hex, "logical_turn_id": None, "timestamp": datetime.now().isoformat()}, "parts": [{"type": "text", "text": instruction}]})
-            kwargs["items"] = items
-        return {"action": "continue", "modified_kwargs": kwargs}
-
-    @Tool("neko_voice_reply", brief_description="让本轮回复额外发送语音，可指定语气；默认不发语音。",
-          parameters=[ToolParameterInfo(name="style", param_type=ToolParamType.STRING, description="本轮语音语气，例如温柔、撒娇、轻声、兴奋；留空使用默认语气", required=False, default="")])
-    async def request_voice(self, style: str = "", **kwargs: Any) -> Dict[str, Any]:
-        if not self.config.plugin.enabled:
-            return {"success": False, "content": "Neko TTS 未启用"}
-        stream = str(kwargs.get("stream_id") or kwargs.get("session_id") or "").strip()
-        if not stream:
-            return {"success": False, "content": "无法获取当前聊天流"}
-        self._voice_intents[stream] = (time.monotonic() + 30.0, style.strip()[:240])
-        return {"success": True, "content": "本轮已登记语音意图。现在调用 reply；语音会在文字发送成功后补发。"}
-
-    @HookHandler("send_service.after_send", name="neko_tts_after_send", mode=HookMode.BLOCKING,
-                 order=HookOrder.LATE, timeout_ms=300000, error_policy=ErrorPolicy.SKIP)
-    async def after_send(self, message: Optional[Dict[str, Any]] = None, **kwargs: Any) -> None:
-        if not self.config.plugin.enabled or not kwargs.get("sent"):
-            return None
-        stream = str(kwargs.get("stream_id") or (message or {}).get("session_id") or "").strip()
-        intent = self._voice_intents.pop(stream, None)
-        if not intent or intent[0] < time.monotonic():
-            return None
-        text = " ".join(str(x.get("data", "")) for x in (message or {}).get("raw_message", []) if isinstance(x, dict) and x.get("type") == "text").strip()
+    async def _render(self, text, style):
+        if not self._ready or not self.config.plugin.enabled:
+            raise ValueError("插件未启用或正在重载")
+        if not isinstance(style, str) or len(style) > 240:
+            raise ValueError("语气提示必须是240字以内文本")
+        config = self.config.model_dump()
+        chunks = split_text(text, config['general'])
+        generation = self._generation
+        task = asyncio.create_task(self._engine.render(chunks, style, config))
+        self._tasks.add(task)
         try:
-            audio = await self._synthesize(text, intent[1])
-            await self.ctx.send.custom("voice", base64.b64encode(audio).decode("ascii"), stream, processed_plain_text=text, sync_to_maisaka_history=False, maisaka_source_kind="neko_tts")
+            result = await task
+            if generation != self._generation:
+                raise ValueError("配置已更新，请重新调用")
+            return result
+        finally:
+            self._tasks.discard(task)
+
+    @ReplyExtension(
+        "voice",
+        description=("你想用语音表达这条回复时才选择。默认仅文字，不必每次选；可按心情填写 style。"
+                     "保留原文字和附件，另发独立语音；参数仅本次生效。"),
+        parameters={"type": "object", "properties": {
+            "style": {"type": "string", "maxLength": 240, "default": "",
+                      "description": "本次语气、情绪或节奏，如轻声温柔、开心俏皮；不作为朗读正文。"}},
+            "additionalProperties": False},
+        priority=20, timeout_ms=240000,
+    )
+    async def voice_reply_extension(self, phase="", text="", messages=None, parameters=None, **kwargs):
+        if not self._ready or not self.config.plugin.enabled:
+            return {}
+        if phase == "prepare":
+            return {}  # Voice style must not leak into the text-generation prompt.
+        if phase != "before_send":
+            return {}
+        try:
+            # Use actually generated text segments, excluding mentions/quotes/media.
+            spoken = "\n".join(segment['data'] for message in (messages or [])
+                               for segment in message.get('segments', [])
+                               if segment.get('type') == 'text' and isinstance(segment.get('data'), str))
+            audio = await self._render(spoken, (parameters or {}).get('style', ''))
+            return {"messages": deepcopy(messages) + [voice_message(audio)]}
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            self.ctx.logger.error("Neko TTS 补发语音失败：%s", exc)
+            self.ctx.logger.warning("Neko TTS 合成失败，保留原回复：%s", type(exc).__name__)
+            return {}
 
-    @Command("neko_tts_cmd", description="手动生成 Neko TTS 语音", pattern=r"^/neko-tts\s+(?P<text>.+)$")
-    async def command(self, stream_id: str = "", user_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any):
-        if str(user_id) not in {str(x) for x in self.config.command.allowed_user_ids}:
+    @Command("neko_tts_cmd", description="测试语音：/neko-tts <文本>；/neko-tts status 查看模式",
+             pattern=r"^/neko-tts(?:\s+(?P<text>[\s\S]+))?$")
+    async def command(self, stream_id="", user_id="", matched_groups=None, **kwargs):
+        if not self.config.plugin.enabled or not self._ready:
+            return False, "Neko TTS 未启用", True
+        if not user_id or str(user_id) not in {str(x) for x in self.config.command.allowed_user_ids}:
             return False, "测试命令未开放", True
-        audio = await self._synthesize(str((matched_groups or {}).get("text") or ""), "")
-        sent = await self.ctx.send.custom("voice", base64.b64encode(audio).decode("ascii"), stream_id, processed_plain_text="", sync_to_maisaka_history=False, maisaka_source_kind="neko_tts")
-        return bool(sent), "语音已发送" if sent else "语音发送失败", True
+        if not stream_id:
+            return False, "无法获取当前聊天", True
+        text = str((matched_groups or {}).get('text') or '').strip()
+        if text == 'status':
+            return True, f"Neko TTS：{self.config.mimo.synthesis_mode}；按回复选择语音。", True
+        if not text:
+            return False, "用法：/neko-tts <文本>", True
+        try:
+            audio = await self._render(text, '')
+            sent = await self.ctx.send.custom('voice', base64.b64encode(audio).decode('ascii'), stream_id,
+                                             processed_plain_text=text, sync_to_maisaka_history=True,
+                                             maisaka_source_kind='tool_voice')
+            return bool(sent), "语音已发送" if sent else "语音发送失败", True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning("Neko TTS 测试失败：%s", type(exc).__name__)
+            return False, "语音合成失败，请检查配置和服务状态。", True
 
 
-def create_plugin() -> NekoTTS:
+def create_plugin():
     return NekoTTS()

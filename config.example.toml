@@ -1,10 +1,12 @@
 [plugin]
 enabled = false
-config_version = "0.1.0"
+config_version = "0.2.0"
 
 [general]
 timeout = 120
 max_text_length = 500
+max_total_length = 2000
+max_segments = 8
 
 [voice]
 voice_dir = ""
@@ -17,7 +19,9 @@ ffmpeg_path = ""
 [mimo]
 api_key = ""
 api_base_url = "https://api.xiaomimimo.com/v1"
+synthesis_mode = "voiceclone"
 model = "mimo-v2.5-tts-voiceclone"
+preset_voice = "冰糖"
 audio_format = "mp3"
 
 [command]

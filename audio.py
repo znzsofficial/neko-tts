@@ -1,0 +1,192 @@
+"""MiMo transport, bounded text segmentation and deterministic reference preparation."""
+import asyncio
+import base64
+import hashlib
+import json
+import re
+import shutil
+import tempfile
+import sys
+from pathlib import Path
+from urllib.parse import urlparse
+
+import aiohttp
+
+
+def split_text(text, config):
+    text = re.sub(r'```[\s\S]*?```', '', text)
+    text = re.sub(r'\[([^\]]+)\]\(https?://[^)]+\)', r'\1', text)
+    text = re.sub(r'https?://\S+|\[CQ:[^\]]+\]', '', text)
+    text = re.sub(r'[`*_#]', '', text).strip()
+    if not text or len(text) > config['max_total_length']:
+        raise ValueError('文本为空或超过总长度限制')
+    limit = config['max_text_length']
+    chunks, current = [], ''
+    for sentence in re.findall(r'[^。！？!?；;\n]+[。！？!?；;\n]*|[。！？!?；;\n]+', text):
+        while sentence:
+            if current and len(current) + len(sentence) > limit:
+                chunks.append(current)
+                current = ''
+            take, sentence = sentence[:limit], sentence[limit:]
+            current += take
+            if sentence:
+                chunks.append(current)
+                current = ''
+    if current:
+        chunks.append(current)
+    if len(chunks) > config['max_segments']:
+        raise ValueError('语音分段过多')
+    return chunks
+
+
+def voice_message(audio):
+    return {'segments': [{'type': 'voice', 'data': '',
+                          'binary_data_base64': base64.b64encode(audio).decode('ascii')}],
+            'quote_previous': False}
+
+
+async def run(*args):
+    process = await asyncio.create_subprocess_exec(*map(str, args), stdout=asyncio.subprocess.PIPE,
+                                                   stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), 60)
+        if process.returncode:
+            raise RuntimeError('音频处理失败')
+        return stdout, stderr.decode('utf-8', 'replace')
+    except BaseException:
+        if process.returncode is None:
+            process.kill()
+        await process.communicate()
+        raise
+
+
+def ffmpeg(config):
+    value = config['voice']['ffmpeg_path'] or shutil.which('ffmpeg')
+    if not value:
+        raise ValueError('需要 FFmpeg')
+    return value
+
+
+class SpeechEngine:
+    def __init__(self, runtime_dir):
+        self.root = Path(runtime_dir)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lock = asyncio.Lock()
+        self.session = None
+        self.reference_key = ''
+        self.reference_uri = ''
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+        self.session = None
+        self.reference_uri = ''
+        self.reference_key = ''
+
+    async def reference(self, config):
+        voice = config['voice']
+        if not voice['voice_dir'].strip():
+            raise ValueError('参考目录未配置')
+        root = Path(voice['voice_dir']).expanduser().resolve()
+        files = sorted(p for p in root.iterdir() if p.is_file() and not p.is_symlink()
+                       and p.suffix.lower() in {'.wav', '.mp3', '.flac', '.m4a', '.ogg', '.opus'})
+        preferred = voice['preferred_reference_file']
+        if preferred:
+            files = [p for p in files if p.name == preferred]
+        if not files:
+            raise ValueError('没有可用参考音频')
+        key = hashlib.sha256(json.dumps([voice, [(str(p), p.stat().st_size, p.stat().st_mtime_ns)
+                                                  for p in files]], sort_keys=True).encode()).hexdigest()
+        if key == self.reference_key:
+            return self.reference_uri
+        binary = ffmpeg(config)
+        # Analyse at most 60s/file, choose longest audible span, not first filename.
+        candidates = []
+        for path in files[:32]:
+            try:
+                data, _ = await run(binary, '-v', 'error', '-i', path, '-t', '60', '-vn',
+                                    '-ac', '1', '-ar', '24000', '-f', 's16le', 'pipe:1')
+                import array
+                pcm = array.array('h', data)
+                if sys.byteorder != 'little':
+                    pcm.byteswap()
+                threshold = 184  # approx -45 dBFS
+                non_silent = [i for i in range(0, len(pcm), 240)
+                              if max(map(abs, pcm[i:i+240]), default=0) > threshold]
+                if non_silent:
+                    start = max(0, non_silent[0] / 24000 - .08)
+                    end = min(len(pcm) / 24000, non_silent[-1] / 24000 + .10)
+                    score = min(len(non_silent) * .01, voice['max_clip_duration'])
+                    candidates.append((score, path, start, end - start))
+            except RuntimeError:
+                continue
+        if not candidates:
+            raise ValueError('参考音频无有效有声片段或无法解码')
+        _, path, start, duration = max(candidates, key=lambda value: value[0])
+        data, _ = await run(binary, '-v', 'error', '-ss', start, '-i', path, '-t',
+                            min(duration, voice['max_clip_duration']), '-vn', '-ac', '1',
+                            '-ar', voice['sample_rate'], '-c:a', 'pcm_s16le', '-f', 'wav', 'pipe:1')
+        encoded = base64.b64encode(data).decode('ascii')
+        if len(data) < 1000 or len(encoded) > 9_500_000:
+            raise ValueError('参考音频大小不合适')
+        self.reference_key = key
+        self.reference_uri = 'data:audio/wav;base64,' + encoded
+        return self.reference_uri
+
+    async def render(self, chunks, style, config):
+        async with asyncio.timeout(config['general']['timeout']):
+            async with self.lock:
+                mimo = config['mimo']
+                endpoint = mimo['api_base_url'].rstrip('/')
+                parsed = urlparse(endpoint)
+                if parsed.scheme not in {'http', 'https'} or not parsed.netloc or parsed.username:
+                    raise ValueError('MiMo 地址无效')
+                if not mimo['api_key'].strip():
+                    raise ValueError('MiMo 密钥为空')
+                if not endpoint.endswith('/chat/completions'):
+                    endpoint += '/chat/completions'
+                preset = mimo['synthesis_mode'] == 'preset'
+                voice = mimo['preset_voice'] if preset else await self.reference(config)
+                prompt = config['voice']['clone_prompt'].strip()
+                if style.strip():
+                    prompt += '\n本次表达方式：' + style.strip()
+                if not self.session:
+                    self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=config['general']['timeout']))
+                audios = []
+                for chunk in chunks:
+                    body = {'model': 'mimo-v2.5-tts' if preset else mimo['model'],
+                            'messages': [{'role': 'user', 'content': prompt}, {'role': 'assistant', 'content': chunk}],
+                            'audio': {'format': mimo['audio_format'], 'voice': voice}}
+                    async with self.session.post(endpoint, json=body, headers={'api-key': mimo['api_key']}, allow_redirects=False) as response:
+                        if response.status != 200:
+                            raise RuntimeError(f'MiMo HTTP {response.status}')
+                        raw = bytearray()
+                        async for block in response.content.iter_chunked(65536):
+                            raw.extend(block)
+                            if len(raw) > 24 * 1024 * 1024:
+                                raise ValueError('合成响应过大')
+                    audio = base64.b64decode(json.loads(raw)['choices'][0]['message']['audio']['data'], validate=True)
+                    if len(audio) < 100 or not (audio.startswith((b'RIFF', b'ID3')) or audio[0] == 255):
+                        raise ValueError('合成响应不是支持的音频')
+                    audios.append(audio)
+                if len(audios) == 1:
+                    return audios[0]
+                return await self.merge(audios, config)
+
+    async def merge(self, audios, config):
+        # Real decoding/encoding, never concatenate MP3/WAV bytes directly.
+        with tempfile.TemporaryDirectory(prefix='neko-tts-', dir=self.root) as directory:
+            root = Path(directory)
+            args = [ffmpeg(config), '-v', 'error', '-y']
+            for i, audio in enumerate(audios):
+                path = root / f'{i}.audio'
+                path.write_bytes(audio)
+                args.extend(['-i', path])
+            filters = ''.join(f'[{i}:a:0]aresample=24000,aformat=sample_fmts=s16:channel_layouts=mono[a{i}];'
+                              for i in range(len(audios)))
+            filters += ''.join(f'[a{i}]' for i in range(len(audios))) + f'concat=n={len(audios)}:v=0:a=1[out]'
+            output = root / 'combined.wav'
+            await run(*args, '-filter_complex', filters, '-map', '[out]', '-c:a', 'pcm_s16le', output)
+            if output.stat().st_size > 20 * 1024 * 1024:
+                raise ValueError('合并音频过大')
+            return output.read_bytes()
