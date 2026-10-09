@@ -20,7 +20,7 @@ except ImportError:
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.4.0")
+    config_version: str = Field(default="0.4.1")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -34,7 +34,7 @@ class VoiceConfig(PluginConfigBase):
     voice_dir: str = Field(default="", description="参考音频目录；预置音色不使用")
     preferred_reference_file: str = Field(default="", description="固定单个参考文件名；空时自动选择有效有声时长较长的一段")
     reference_strategy: Literal["best_single", "balanced", "full_merge"] = Field(default="best_single", description="单段、每段均衡片段或完整拼接")
-    clone_prompt: str = Field(default="保持参考音色，自然清晰地说话。", description="基础合成提示；本轮 style 追加于其后")
+    clone_prompt: str = Field(default="用原本的音色和语气说话，保持自然流畅", description="固定基础提示；本轮 style 仅补充情绪语气，不覆盖基础要求")
     sample_rate: Literal[16000, 24000, 44100, 48000] = 24000
     max_clip_duration: float = Field(default=15.0, ge=3.0, le=30.0)
     ffmpeg_path: str = Field(default="", description="FFmpeg 路径；空时从 PATH 查找")
@@ -127,13 +127,12 @@ class NekoTTS(MaiBotPlugin):
     @ReplyExtension(
         "voice",
         description=("你想用语音表达这条回复时才选择。默认仅文字，不必每次选；可按心情填写 style。"
-                     "保留原文字和附件，另发独立语音；参数仅本次生效。"),
+                      "保留原文字和附件，另发独立语音；参数仅本次生效。"),
         parameters={"type": "object", "properties": {
             "style": {"type": "string", "maxLength": 240, "default": "",
-                      "description": ("仅本轮声音表达，不是朗读正文。用简短、具体且一致的描述，"
-                                      "可按情绪、语速、音量、停顿、表演程度组织；无需全部填写。"
-                                      "例如：情绪温柔安慰；语速稍慢；音量偏低；自然短停顿；表演克制。"
-                                      "避免只写可爱一点、有感情，不要求改写正文。")}},
+                       "description": ("只补充本轮情绪语气，例如温柔安慰、开心或略带委屈；不确定时留空。"
+                                       "保持固定提示指定的原本音色和自然表达，不指定音色、年龄、"
+                                       "语速、音量或停顿，不要求改写正文。")}},
             "additionalProperties": False},
         priority=20, timeout_ms=240000,
     )

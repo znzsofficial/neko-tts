@@ -64,6 +64,20 @@ class TransportTests(IsolatedAsyncioTestCase):
         self.assertIn('轻声', body['messages'][0]['content'])
         self.assertEqual(body['messages'][1]['content'], '你好')
 
+    async def test_fixed_prompt_without_style_is_verbatim(self):
+        base = '用原本的音色和语气说话，保持自然流畅'
+        self.assertEqual(self.config['voice']['clone_prompt'], base)
+        await self.engine.render(['你好'], '', self.config)
+        self.assertEqual(self.calls[0][0]['messages'][0]['content'], base)
+
+    async def test_style_only_supplements_fixed_prompt(self):
+        prompt = self.engine._build_prompt(self.config['voice']['clone_prompt'], '温柔安慰')
+        self.assertTrue(prompt.startswith('用原本的音色和语气说话，保持自然流畅\n'))
+        self.assertIn('仅补充本轮情绪语气', prompt)
+        self.assertIn('本轮情绪语气：温柔安慰', prompt)
+        self.assertNotIn('以本轮为准', prompt)
+        self.assertNotIn('语速适中', prompt)
+
     async def test_clone_and_segment_order(self):
         self.config['mimo']['synthesis_mode'] = 'voiceclone'
         self.engine.reference = AsyncMock(return_value='data:audio/wav;base64,ref')

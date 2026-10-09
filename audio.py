@@ -242,12 +242,12 @@ class SpeechEngine:
     def _build_prompt(base, style):
         base = base.strip()
         style = style.strip()
+        if not style:
+            return base
         return '\n'.join(part for part in (
-            '自然朗读正文，保持所选音色。声音要求只用于表达，不作为朗读内容。',
-            '不要添加、删除、改写或解释正文。',
-            f'基础声音要求：{base}' if base else '',
-            '本轮声音要求（与基础语气冲突时，以本轮为准；未指定项保持自然）：',
-            style or '情绪自然；语速适中；音量正常；停顿自然；表演克制。',
+            base,
+            '在保持上述基础要求的前提下，仅补充本轮情绪语气；不改变音色或原本说话节奏，不改写正文，不朗读提示。',
+            f'本轮情绪语气：{style}',
         ) if part)
 
     async def merge(self, audios, config):
