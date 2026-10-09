@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "0.4.1"
+config_version = "0.5.0"
 
 [general]
 timeout = 120
@@ -11,6 +11,11 @@ max_segments = 8
 [output]
 # text_and_voice：文字和语音同批发送；text_then_voice：文字先发，成功后后台补语音；voice_only：本轮只发送语音
 mode = "text_and_voice"
+
+[trigger]
+# planner：仅主动选择；hybrid：每条 reply 随机，主动选择始终生效
+mode = "planner"
+probability = 0.3
 
 [voice]
 voice_dir = ""

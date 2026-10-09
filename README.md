@@ -1,6 +1,6 @@
-# Neko TTS 0.4.1
+# Neko TTS 0.5.0
 
-独立的 MaiBot 语音插件。**默认文字，麦麦想用语音表达时才主动选择**，没有随机概率，也没有“默认语音、文字例外”。支持 MiMo 音色克隆与预置音色。
+独立的 MaiBot 语音插件。固定合成提示，支持仅主动选择或**随机＋主动选择混合模式**，没有“默认语音、文字例外”。支持 MiMo 音色克隆与预置音色。
 
 ## 安装
 
@@ -17,10 +17,12 @@ git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
 使用 1.3.5 原生 `ReplyExtension`。Planner 的 `reply` 自动出现可选参数，例如：
 
 ```json
-{"plugin_options":{"neko.tts.voice":{"style":"温柔安慰"}}}
+{"plugin_options":{"neko.tts.voice":{}}}
 ```
 
-这只是 `reply` 的扩展部分，其余必填参数照常填写。不填就完全不参与回复；填了才合成。`style` 只用于此次 TTS，不进入文字生成提示，也不保存为全局状态。固定 `clone_prompt` 为基础，本轮只补充情绪语气；模型是否准确表现情绪需要试听验证。
+这只是 `reply` 的扩展部分，其余必填参数照常填写。`trigger.mode=planner`（默认）仅在主动选择时合成。`trigger.mode=hybrid` 每条 reply 按 `trigger.probability`（默认0.3）随机；用户要求语音时 Planner 仍可主动选择，不受概率限制。随机与主动都使用同一个 ReplyExtension，不会叠加两遍合成。只是引导 Planner 正确选择工具，不保证模型每次都遵循用户要求。
+
+混合模式在 `maisaka.planner.after_response` 对未主动选择语音的 reply 调用补充扩展参数，不改正文或其他工具。按 reply 抽样，不是每个断句单独抽样；后续分段与合并保持不变，无聊天级概率缓存。概率0为仅主动选择，概率1为每条 reply 都选语音。异常或不支持的 Hook 载荷跳过随机路径。`style` 仅为旧调用兼容而接受，始终忽略，不进入合成提示。
 
 初版 `neko_voice_reply` 工具已移除。`text_and_voice` / `voice_only` 的语气参数直接绑定当前 reply；后台模式的关联限制见下文。
 
@@ -42,7 +44,7 @@ MiMo 返回 429/502/503/504 时最多退避重试两次；第一次请求 `finis
 
 ## 合成配置
 
-固定提示默认为“用原本的音色和语气说话，保持自然流畅”。不传 `style` 时原样发送；传入时直接以逗号追加，例如“用原本的音色和语气说话，保持自然流畅，温柔安慰”，不加标签或解释性模板。Planner 只被引导填写简短情绪语气，不指定音色、年龄、语速、音量或停顿。提示放在 MiMo 的 user 消息，朗读正文独立放在 assistant 消息。实际情绪表现仍需试听确认；这不是对自由文本 style 的强制语义过滤。
+固定提示默认为“用原本的音色和语气说话，保持自然流畅”，原样发送，不追加麦麦的语气或模板。提示放在 MiMo 的 user 消息，朗读正文独立放在 assistant 消息，与旧 ling-tts-bot 的固定提示模式一致；参考音频处理仍沿用本插件，不代表两插件的全部音频链路相同。
 
 - `mimo.synthesis_mode=voiceclone`：使用参考目录；`preferred_reference_file` 可将候选限制为固定文件名，适用于所有参考策略。
 - `best_single` 自动选择：最多分析32个文件、每文件前60秒，根据有效有声时长选一段；不是说话人识别或主观音质评分。统一单声道 WAV，裁首尾静音并限制长度，保留片段内停顿。原始文件不修改；参考仅缓存内存。
@@ -68,7 +70,7 @@ MiMo 返回 429/502/503/504 时最多退避重试两次；第一次请求 `finis
 uv run --no-project --with maibot-plugin-sdk==2.10.0 --with aiohttp python -m unittest -q
 ```
 
-24 项测试覆盖真实 SDK 导入、回复扩展参数隔离/失败回退、命令鉴权、分段保真、固定提示原样发送/情绪补充约束、模拟 MiMo HTTP、限流退避、缺失音频恢复和重试上限，以及实际 FFmpeg 参考选取和合并。无系统 FFmpeg 时可在测试命令加 `--with imageio-ffmpeg`。
+测试覆盖真实 SDK 导入、混合触发/主动优先/避免重复/其他工具不变、回复扩展失败回退、命令鉴权、分段保真、固定提示原样发送/style忽略、模拟 MiMo HTTP、限流退避、缺失音频恢复和重试上限，以及实际 FFmpeg 参考选取和合并。无系统 FFmpeg 时可在测试命令加 `--with imageio-ffmpeg`。
 
 2026-10-07 已用线上配置复现缺少 audio 和 HTTP 429，并在修复后对原失败文本完成真实合成；用户反馈暂时正常。接口合成测试与 QQ 最终投递是两项不同的验证。
 

@@ -4,7 +4,7 @@ from copy import deepcopy
 import tempfile
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from plugin import NekoTTS, Config
 from audio import split_text, voice_message
@@ -57,7 +57,7 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertEqual(self.messages, before)
         self.assertEqual(result['messages'][:-1], before)
         self.assertFalse(result['messages'][-1]['quote_previous'])
-        self.p._render.assert_awaited_once_with('你好', '轻声')
+        self.p._render.assert_awaited_once_with('你好', '')
         self.p.ctx.send.custom.assert_not_called()
 
     async def test_voice_only_drops_text_but_keeps_one_voice(self):
@@ -73,7 +73,7 @@ class PluginTests(IsolatedAsyncioTestCase):
                                                     parameters={'style': '轻声'})
         self.assertEqual(result['messages'], self.messages)
         self.p._render.assert_not_called()
-        self.assertEqual(self.p._pending['chat-a'][0][1], '轻声')
+        self.assertEqual(self.p._pending['chat-a'][0][1], '')
 
     async def test_text_then_voice_starts_only_after_matching_send(self):
         self.p.config.output.mode = 'text_then_voice'
@@ -96,10 +96,50 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=self.messages), {})
         self.p._render.assert_not_called()
 
-    async def test_concurrent_styles_are_call_local(self):
+    async def test_concurrent_styles_are_ignored(self):
         await asyncio.gather(*(self.p.voice_reply_extension(phase='before_send', messages=self.messages,
                                                           parameters={'style': style}) for style in ('开心', '轻声')))
-        self.assertEqual({call.args[1] for call in self.p._render.await_args_list}, {'开心', '轻声'})
+        self.assertEqual({call.args[1] for call in self.p._render.await_args_list}, {''})
+
+    def reply_item(self, args=None):
+        return {'item_type': 'FunctionCallItem', 'meta': {'item_id': 'id'},
+                'tool_call': {'call_id': 'call', 'func_name': 'reply', 'args': args or {'msg_id': 'message'}, 'extra_content': None}}
+
+    async def test_hybrid_random_injects_once_preserving_other_options(self):
+        self.p.config.trigger.mode = 'hybrid'
+        item = self.reply_item({'msg_id': 'x', 'plugin_options': {'other.ext': {}}})
+        original = deepcopy(item)
+        with patch('plugin.random.random', return_value=0.1) as roll:
+            result = await self.p.hybrid_reply(output_items=[item], session_id='chat', item_schema_version=1)
+            modified = result['modified_kwargs']
+            self.assertEqual(modified['output_items'][0]['tool_call']['args']['plugin_options'], {'other.ext': {}, 'neko.tts.voice': {}})
+            self.assertEqual(modified['item_schema_version'], 1)
+            self.assertEqual(item, original)
+            self.assertIsNone(await self.p.hybrid_reply(**modified))
+            roll.assert_called_once()
+
+    async def test_hybrid_explicit_selection_bypasses_random(self):
+        self.p.config.trigger.mode = 'hybrid'
+        self.p.config.trigger.probability = 0
+        with patch('plugin.random.random', side_effect=AssertionError('explicit never rolls')):
+            self.assertIsNone(await self.p.hybrid_reply(output_items=[self.reply_item({'plugin_options': {'neko.tts.voice': {}}})], session_id='chat'))
+        result = await self.p.voice_reply_extension(phase='before_send', messages=self.messages)
+        self.assertEqual(result['messages'][-1]['segments'][0]['type'], 'voice')
+
+    async def test_hybrid_miss_and_planner_disabled_do_not_inject(self):
+        with patch('plugin.random.random', return_value=0.9):
+            self.assertIsNone(await self.p.hybrid_reply(output_items=[self.reply_item()], session_id='chat'))
+            self.p.config.trigger.mode = 'hybrid'
+            self.assertIsNone(await self.p.hybrid_reply(output_items=[self.reply_item()], session_id='chat'))
+            self.p.config.plugin.enabled = False
+            self.assertIsNone(await self.p.hybrid_reply(output_items=[self.reply_item()], session_id='chat'))
+
+    async def test_hybrid_ignores_other_tools_and_malformed_items(self):
+        self.p.config.trigger.mode = 'hybrid'
+        other = self.reply_item(); other['tool_call']['func_name'] = 'neko_draw'
+        with patch('plugin.random.random', side_effect=AssertionError('not a reply')):
+            self.assertIsNone(await self.p.hybrid_reply(output_items=[None, {}, other, self.reply_item({'plugin_options': None})], session_id='chat'))
+            self.assertIsNone(await self.p.hybrid_reply(output_items=[self.reply_item()], session_id=''))
 
     async def test_command_authorization_and_send_failure(self):
         self.assertFalse((await self.p.command(stream_id='a', user_id='other', matched_groups={'text': '你好'}))[0])

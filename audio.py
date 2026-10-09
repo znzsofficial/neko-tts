@@ -240,9 +240,8 @@ class SpeechEngine:
 
     @staticmethod
     def _build_prompt(base, style):
-        base = base.strip()
-        style = style.strip()
-        return '，'.join(part for part in (base, style) if part)
+        # Accept the legacy argument but never let Planner change the prompt.
+        return base.strip()
 
     async def merge(self, audios, config):
         # Real decoding/encoding, never concatenate MP3/WAV bytes directly.

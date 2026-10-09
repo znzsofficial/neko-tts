@@ -5,6 +5,7 @@ import asyncio
 import base64
 from copy import deepcopy
 import hashlib
+import random
 import time
 from typing import Any, Literal
 
@@ -20,7 +21,7 @@ except ImportError:
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.4.1")
+    config_version: str = Field(default="0.5.0")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -34,7 +35,7 @@ class VoiceConfig(PluginConfigBase):
     voice_dir: str = Field(default="", description="参考音频目录；预置音色不使用")
     preferred_reference_file: str = Field(default="", description="固定单个参考文件名；空时自动选择有效有声时长较长的一段")
     reference_strategy: Literal["best_single", "balanced", "full_merge"] = Field(default="best_single", description="单段、每段均衡片段或完整拼接")
-    clone_prompt: str = Field(default="用原本的音色和语气说话，保持自然流畅", description="固定基础提示；本轮 style 仅补充情绪语气，不覆盖基础要求")
+    clone_prompt: str = Field(default="用原本的音色和语气说话，保持自然流畅", description="固定合成提示；Planner 的 style 已忽略")
     sample_rate: Literal[16000, 24000, 44100, 48000] = 24000
     max_clip_duration: float = Field(default=15.0, ge=3.0, le=30.0)
     ffmpeg_path: str = Field(default="", description="FFmpeg 路径；空时从 PATH 查找")
@@ -56,6 +57,11 @@ class OutputConfig(PluginConfigBase):
     )
 
 
+class TriggerConfig(PluginConfigBase):
+    mode: Literal["planner", "hybrid"] = Field(default="planner", description="planner=仅麦麦主动选择；hybrid=随机语音＋麦麦主动选择")
+    probability: float = Field(default=0.3, ge=0.0, le=1.0, description="混合模式每条 reply 的随机语音概率；主动选择不受概率限制")
+
+
 class CommandConfig(PluginConfigBase):
     allowed_user_ids: list[str] = Field(default_factory=list, description="/neko-tts 测试命令白名单；空表示不开放")
 
@@ -66,6 +72,7 @@ class Config(PluginConfigBase):
     voice: VoiceConfig = Field(default_factory=VoiceConfig)
     mimo: MimoConfig = Field(default_factory=MimoConfig)
     output: OutputConfig = Field(default_factory=OutputConfig)
+    trigger: TriggerConfig = Field(default_factory=TriggerConfig)
     command: CommandConfig = Field(default_factory=CommandConfig)
 
 
@@ -83,7 +90,7 @@ class NekoTTS(MaiBotPlugin):
     async def on_load(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
         self._ready = True
-        self.ctx.logger.info("Neko TTS 已加载：按 reply 主动选择语音")
+        self.ctx.logger.info("Neko TTS 已加载：固定提示；mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
     async def _reset(self):
         self._ready = False
@@ -105,6 +112,7 @@ class NekoTTS(MaiBotPlugin):
             await self._reset()
             self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
             self._ready = True
+            self.ctx.logger.info("Neko TTS 配置已更新：mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
     async def _render(self, text, style):
         if not self._ready or not self.config.plugin.enabled:
@@ -114,7 +122,7 @@ class NekoTTS(MaiBotPlugin):
         config = self.config.model_dump()
         chunks = split_text(text, config['general'])
         generation = self._generation
-        task = asyncio.create_task(self._engine.render(chunks, style, config))
+        task = asyncio.create_task(self._engine.render(chunks, '', config))
         self._tasks.add(task)
         try:
             result = await task
@@ -126,13 +134,12 @@ class NekoTTS(MaiBotPlugin):
 
     @ReplyExtension(
         "voice",
-        description=("你想用语音表达这条回复时才选择。默认仅文字，不必每次选；可按心情填写 style。"
-                      "保留原文字和附件，另发独立语音；参数仅本次生效。"),
+        description=("用户要求语音回复，或你想用语音表达时，主动选择此扩展（参数填 {}）。"
+                      "主动选择不受随机概率限制；不要只在正文说会发语音。"
+                      "使用固定音色和语气提示，不填写 style；参数仅本次生效。"),
         parameters={"type": "object", "properties": {
             "style": {"type": "string", "maxLength": 240, "default": "",
-                       "description": ("只补充本轮情绪语气，例如温柔安慰、开心或略带委屈；不确定时留空。"
-                                       "保持固定提示指定的原本音色和自然表达，不指定音色、年龄、"
-                                       "语速、音量或停顿，不要求改写正文。")}},
+                       "description": "兼容旧调用；已忽略，不要填写。固定提示不受本轮参数影响。"}},
             "additionalProperties": False},
         priority=20, timeout_ms=240000,
     )
@@ -148,7 +155,7 @@ class NekoTTS(MaiBotPlugin):
             spoken = "\n".join(segment['data'] for message in (messages or [])
                                for segment in message.get('segments', [])
                                if segment.get('type') == 'text' and isinstance(segment.get('data'), str))
-            style = str((parameters or {}).get('style') or '')
+            style = ''
             if self.config.output.mode == "text_then_voice":
                 stream_id = str(kwargs.get("session_id") or "").strip()
                 self._pending.setdefault(stream_id, []).append(
@@ -165,6 +172,37 @@ class NekoTTS(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.warning("Neko TTS 合成失败，保留原回复：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
             return {}
+
+    @HookHandler("maisaka.planner.after_response", name="neko_tts_hybrid", mode=HookMode.BLOCKING,
+                 order=HookOrder.LATE, error_policy=ErrorPolicy.SKIP)
+    async def hybrid_reply(self, output_items=None, session_id="", **kwargs):
+        """Opt random replies into the same extension; never run a second TTS path."""
+        if (not self._ready or not self.config.plugin.enabled or self.config.trigger.mode != "hybrid"
+                or not session_id or not isinstance(output_items, list)):
+            return None
+        items = deepcopy(output_items)
+        changed = False
+        for item in items:
+            if not isinstance(item, dict) or item.get('item_type') != 'FunctionCallItem':
+                continue
+            call = item.get('tool_call')
+            if not isinstance(call, dict) or call.get('func_name') != 'reply':
+                continue
+            args = call.get('args')
+            if not isinstance(args, dict):
+                continue
+            options = args.get('plugin_options', {})
+            if not isinstance(options, dict) or 'neko.tts.voice' in options:
+                continue  # Explicit selection wins, even with probability zero.
+            if random.random() >= self.config.trigger.probability:
+                continue
+            options = deepcopy(options)
+            options['neko.tts.voice'] = {}
+            args['plugin_options'] = options
+            changed = True
+        if not changed:
+            return None
+        return {"action": "continue", "modified_kwargs": dict(kwargs, output_items=items, session_id=session_id)}
 
     @HookHandler("send_service.after_send", name="neko_tts_after_send", mode=HookMode.BLOCKING,
                  order=HookOrder.LATE, timeout_ms=300000, error_policy=ErrorPolicy.SKIP)
@@ -223,7 +261,7 @@ class NekoTTS(MaiBotPlugin):
             return False, "无法获取当前聊天", True
         text = str((matched_groups or {}).get('text') or '').strip()
         if text == 'status':
-            return True, f"Neko TTS：{self.config.mimo.synthesis_mode}；按回复选择语音。", True
+            return True, f"Neko TTS：{self.config.mimo.synthesis_mode}；{self.config.trigger.mode}；随机概率 {self.config.trigger.probability:.0%}；固定提示。", True
         if not text:
             return False, "用法：/neko-tts <文本>", True
         try:

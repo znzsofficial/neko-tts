@@ -61,7 +61,7 @@ class TransportTests(IsolatedAsyncioTestCase):
         self.assertEqual(key, 'test')
         self.assertEqual(body['model'], 'mimo-v2.5-tts')
         self.assertEqual(body['audio']['voice'], '冰糖')
-        self.assertIn('轻声', body['messages'][0]['content'])
+        self.assertEqual(body['messages'][0]['content'], self.config['voice']['clone_prompt'])
         self.assertEqual(body['messages'][1]['content'], '你好')
 
     async def test_fixed_prompt_without_style_is_verbatim(self):
@@ -70,9 +70,9 @@ class TransportTests(IsolatedAsyncioTestCase):
         await self.engine.render(['你好'], '', self.config)
         self.assertEqual(self.calls[0][0]['messages'][0]['content'], base)
 
-    async def test_style_only_supplements_fixed_prompt(self):
+    async def test_style_never_changes_fixed_prompt(self):
         prompt = self.engine._build_prompt(self.config['voice']['clone_prompt'], '温柔安慰')
-        self.assertEqual(prompt, '用原本的音色和语气说话，保持自然流畅，温柔安慰')
+        self.assertEqual(prompt, '用原本的音色和语气说话，保持自然流畅')
 
     async def test_clone_and_segment_order(self):
         self.config['mimo']['synthesis_mode'] = 'voiceclone'
