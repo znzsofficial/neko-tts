@@ -242,13 +242,7 @@ class SpeechEngine:
     def _build_prompt(base, style):
         base = base.strip()
         style = style.strip()
-        if not style:
-            return base
-        return '\n'.join(part for part in (
-            base,
-            '在保持上述基础要求的前提下，仅补充本轮情绪语气；不改变音色或原本说话节奏，不改写正文，不朗读提示。',
-            f'本轮情绪语气：{style}',
-        ) if part)
+        return '，'.join(part for part in (base, style) if part)
 
     async def merge(self, audios, config):
         # Real decoding/encoding, never concatenate MP3/WAV bytes directly.

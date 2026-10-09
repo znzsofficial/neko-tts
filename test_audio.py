@@ -72,11 +72,7 @@ class TransportTests(IsolatedAsyncioTestCase):
 
     async def test_style_only_supplements_fixed_prompt(self):
         prompt = self.engine._build_prompt(self.config['voice']['clone_prompt'], '温柔安慰')
-        self.assertTrue(prompt.startswith('用原本的音色和语气说话，保持自然流畅\n'))
-        self.assertIn('仅补充本轮情绪语气', prompt)
-        self.assertIn('本轮情绪语气：温柔安慰', prompt)
-        self.assertNotIn('以本轮为准', prompt)
-        self.assertNotIn('语速适中', prompt)
+        self.assertEqual(prompt, '用原本的音色和语气说话，保持自然流畅，温柔安慰')
 
     async def test_clone_and_segment_order(self):
         self.config['mimo']['synthesis_mode'] = 'voiceclone'
