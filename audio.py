@@ -184,7 +184,7 @@ class SpeechEngine:
             await run(*args)
             return output.read_bytes()
 
-    async def render(self, chunks, style, config):
+    async def render(self, chunks, config):
         async with asyncio.timeout(config['general']['timeout']):
             async with self.lock:
                 mimo = config['mimo']
@@ -198,7 +198,7 @@ class SpeechEngine:
                     endpoint += '/chat/completions'
                 preset = mimo['synthesis_mode'] == 'preset'
                 voice = mimo['preset_voice'] if preset else await self.reference(config)
-                prompt = self._build_prompt(config['voice']['clone_prompt'], style)
+                prompt = config['voice']['clone_prompt'].strip()
                 if not self.session:
                     self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=config['general']['timeout']))
                 audios = []
@@ -237,11 +237,6 @@ class SpeechEngine:
                 if delay > 30:
                     raise SpeechError(f'MiMo HTTP {status} retry_after_too_long')
             await asyncio.sleep(delay)
-
-    @staticmethod
-    def _build_prompt(base, style):
-        # Accept the legacy argument but never let Planner change the prompt.
-        return base.strip()
 
     async def merge(self, audios, config):
         # Real decoding/encoding, never concatenate MP3/WAV bytes directly.

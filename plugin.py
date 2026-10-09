@@ -1,13 +1,12 @@
-"""Neko TTS — per-reply opt-in speech, without chat-scoped intent state."""
+"""Neko TTS — fixed-prompt speech with explicit or hybrid reply selection."""
 from __future__ import annotations
 
 import asyncio
 import base64
 from copy import deepcopy
-import hashlib
 import random
 import time
-from typing import Any, Literal
+from typing import Literal
 
 from maibot_sdk import (CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler,
                         MaiBotPlugin, PluginConfigBase, ReplyExtension)
@@ -21,7 +20,7 @@ except ImportError:
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.5.0")
+    config_version: str = Field(default="0.5.1")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -35,7 +34,7 @@ class VoiceConfig(PluginConfigBase):
     voice_dir: str = Field(default="", description="参考音频目录；预置音色不使用")
     preferred_reference_file: str = Field(default="", description="固定单个参考文件名；空时自动选择有效有声时长较长的一段")
     reference_strategy: Literal["best_single", "balanced", "full_merge"] = Field(default="best_single", description="单段、每段均衡片段或完整拼接")
-    clone_prompt: str = Field(default="用原本的音色和语气说话，保持自然流畅", description="固定合成提示；Planner 的 style 已忽略")
+    clone_prompt: str = Field(default="用原本的音色和语气说话，保持自然流畅", description="合成提示词")
     sample_rate: Literal[16000, 24000, 44100, 48000] = 24000
     max_clip_duration: float = Field(default=15.0, ge=3.0, le=30.0)
     ffmpeg_path: str = Field(default="", description="FFmpeg 路径；空时从 PATH 查找")
@@ -85,7 +84,7 @@ class NekoTTS(MaiBotPlugin):
         self._tasks = set()
         self._generation = 0
         self._ready = False
-        self._pending: dict[str, list[tuple[str, str, float]]] = {}
+        self._pending: dict[str, list[tuple[str, float]]] = {}
 
     async def on_load(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
@@ -114,15 +113,13 @@ class NekoTTS(MaiBotPlugin):
             self._ready = True
             self.ctx.logger.info("Neko TTS 配置已更新：mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
-    async def _render(self, text, style):
+    async def _render(self, text):
         if not self._ready or not self.config.plugin.enabled:
             raise ValueError("插件未启用或正在重载")
-        if not isinstance(style, str) or len(style) > 240:
-            raise ValueError("语气提示必须是240字以内文本")
         config = self.config.model_dump()
         chunks = split_text(text, config['general'])
         generation = self._generation
-        task = asyncio.create_task(self._engine.render(chunks, '', config))
+        task = asyncio.create_task(self._engine.render(chunks, config))
         self._tasks.add(task)
         try:
             result = await task
@@ -136,18 +133,15 @@ class NekoTTS(MaiBotPlugin):
         "voice",
         description=("用户要求语音回复，或你想用语音表达时，主动选择此扩展（参数填 {}）。"
                       "主动选择不受随机概率限制；不要只在正文说会发语音。"
-                      "使用固定音色和语气提示，不填写 style；参数仅本次生效。"),
-        parameters={"type": "object", "properties": {
-            "style": {"type": "string", "maxLength": 240, "default": "",
-                       "description": "兼容旧调用；已忽略，不要填写。固定提示不受本轮参数影响。"}},
-            "additionalProperties": False},
+                      "使用固定音色和语气提示；参数仅本次生效。"),
+        parameters={"type": "object", "properties": {}, "additionalProperties": False},
         priority=20, timeout_ms=240000,
     )
-    async def voice_reply_extension(self, phase="", text="", messages=None, parameters=None, **kwargs):
+    async def voice_reply_extension(self, phase="", messages=None, **kwargs):
         if not self._ready or not self.config.plugin.enabled:
             return {}
         if phase == "prepare":
-            return {}  # Voice style must not leak into the text-generation prompt.
+            return {}  # Do not alter the text-generation prompt.
         if phase != "before_send":
             return {}
         try:
@@ -155,15 +149,16 @@ class NekoTTS(MaiBotPlugin):
             spoken = "\n".join(segment['data'] for message in (messages or [])
                                for segment in message.get('segments', [])
                                if segment.get('type') == 'text' and isinstance(segment.get('data'), str))
-            style = ''
             if self.config.output.mode == "text_then_voice":
                 stream_id = str(kwargs.get("session_id") or "").strip()
+                if not stream_id:
+                    raise ValueError("无法获取当前聊天")
                 self._pending.setdefault(stream_id, []).append(
-                    (spoken, style, time.monotonic() + 180)
+                    (spoken, time.monotonic() + 180)
                 )
                 return {"messages": deepcopy(messages)}
 
-            audio = await self._render(spoken, style)
+            audio = await self._render(spoken)
             if self.config.output.mode == "voice_only":
                 return {"messages": [voice_message(audio)]}
             return {"messages": deepcopy(messages) + [voice_message(audio)]}
@@ -222,22 +217,26 @@ class NekoTTS(MaiBotPlugin):
             return None
         pending = self._pending.get(stream_id, [])
         now = time.monotonic()
-        match = next(((i, item) for i, item in enumerate(pending) if item[2] > now and item[0] == text), None)
+        match = next(((i, item) for i, item in enumerate(pending) if item[1] > now and item[0] == text), None)
         if match is None:
-            self._pending[stream_id] = [item for item in pending if item[2] > now]
+            remaining = [item for item in pending if item[1] > now]
+            if remaining:
+                self._pending[stream_id] = remaining
+            else:
+                self._pending.pop(stream_id, None)
             return None
-        index, (_, style, _) = match
+        index, _ = match
         pending.pop(index)
         if not pending:
             self._pending.pop(stream_id, None)
-        task = asyncio.create_task(self._background_voice(text, style, stream_id))
+        task = asyncio.create_task(self._background_voice(text, stream_id))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return None
 
-    async def _background_voice(self, text: str, style: str, stream_id: str) -> None:
+    async def _background_voice(self, text: str, stream_id: str) -> None:
         try:
-            audio = await self._render(text, style)
+            audio = await self._render(text)
             sent = await self.ctx.send.custom(
                 "voice", base64.b64encode(audio).decode("ascii"), stream_id,
                 processed_plain_text=text, sync_to_maisaka_history=False,
@@ -265,7 +264,7 @@ class NekoTTS(MaiBotPlugin):
         if not text:
             return False, "用法：/neko-tts <文本>", True
         try:
-            audio = await self._render(text, '')
+            audio = await self._render(text)
             sent = await self.ctx.send.custom('voice', base64.b64encode(audio).decode('ascii'), stream_id,
                                              processed_plain_text=text, sync_to_maisaka_history=True,
                                              maisaka_source_kind='tool_voice')

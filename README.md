@@ -1,4 +1,4 @@
-# Neko TTS 0.5.0
+# Neko TTS 0.5.1
 
 独立的 MaiBot 语音插件。固定合成提示，支持仅主动选择或**随机＋主动选择混合模式**，没有“默认语音、文字例外”。支持 MiMo 音色克隆与预置音色。
 
@@ -22,9 +22,9 @@ git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
 
 这只是 `reply` 的扩展部分，其余必填参数照常填写。`trigger.mode=planner`（默认）仅在主动选择时合成。`trigger.mode=hybrid` 每条 reply 按 `trigger.probability`（默认0.3）随机；用户要求语音时 Planner 仍可主动选择，不受概率限制。随机与主动都使用同一个 ReplyExtension，不会叠加两遍合成。只是引导 Planner 正确选择工具，不保证模型每次都遵循用户要求。
 
-混合模式在 `maisaka.planner.after_response` 对未主动选择语音的 reply 调用补充扩展参数，不改正文或其他工具。按 reply 抽样，不是每个断句单独抽样；后续分段与合并保持不变，无聊天级概率缓存。概率0为仅主动选择，概率1为每条 reply 都选语音。异常或不支持的 Hook 载荷跳过随机路径。`style` 仅为旧调用兼容而接受，始终忽略，不进入合成提示。
+混合模式在 `maisaka.planner.after_response` 对未主动选择语音的 reply 调用补充扩展参数，不改正文或其他工具。按 reply 抽样，不是每个断句单独抽样；后续分段与合并保持不变，无聊天级概率缓存。概率0为仅主动选择，概率1为每条 reply 都选语音。异常或不支持的 Hook 载荷跳过随机路径。扩展参数只接受空对象 `{}`。
 
-初版 `neko_voice_reply` 工具已移除。`text_and_voice` / `voice_only` 的语气参数直接绑定当前 reply；后台模式的关联限制见下文。
+主动选择和随机选择均绑定当前 reply；后台模式的关联限制见下文。
 
 ## 发送与失败
 
@@ -70,7 +70,7 @@ MiMo 返回 429/502/503/504 时最多退避重试两次；第一次请求 `finis
 uv run --no-project --with maibot-plugin-sdk==2.10.0 --with aiohttp python -m unittest -q
 ```
 
-测试覆盖真实 SDK 导入、混合触发/主动优先/避免重复/其他工具不变、回复扩展失败回退、命令鉴权、分段保真、固定提示原样发送/style忽略、模拟 MiMo HTTP、限流退避、缺失音频恢复和重试上限，以及实际 FFmpeg 参考选取和合并。无系统 FFmpeg 时可在测试命令加 `--with imageio-ffmpeg`。
+测试覆盖真实 SDK 导入、混合触发/主动优先/避免重复/其他工具不变、回复扩展失败回退、命令鉴权、分段保真、固定提示原样发送、模拟 MiMo HTTP、限流退避、缺失音频恢复和重试上限，以及实际 FFmpeg 参考选取和合并。无系统 FFmpeg 时可在测试命令加 `--with imageio-ffmpeg`。
 
 2026-10-07 已用线上配置复现缺少 audio 和 HTTP 429，并在修复后对原失败文本完成真实合成；用户反馈暂时正常。接口合成测试与 QQ 最终投递是两项不同的验证。
 

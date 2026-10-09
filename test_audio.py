@@ -53,9 +53,9 @@ class TransportTests(IsolatedAsyncioTestCase):
         await self.runner.cleanup()
         self.temp.cleanup()
 
-    async def test_preset_and_style(self):
+    async def test_preset_fixed_prompt(self):
         self.engine.reference = AsyncMock(side_effect=AssertionError('no reference for preset'))
-        audio = await self.engine.render(['你好'], '轻声', self.config)
+        audio = await self.engine.render(['你好'], self.config)
         self.assertEqual(audio, self.audio)
         body, key = self.calls[0]
         self.assertEqual(key, 'test')
@@ -64,38 +64,39 @@ class TransportTests(IsolatedAsyncioTestCase):
         self.assertEqual(body['messages'][0]['content'], self.config['voice']['clone_prompt'])
         self.assertEqual(body['messages'][1]['content'], '你好')
 
-    async def test_fixed_prompt_without_style_is_verbatim(self):
+    async def test_fixed_prompt_is_verbatim(self):
         base = '用原本的音色和语气说话，保持自然流畅'
         self.assertEqual(self.config['voice']['clone_prompt'], base)
-        await self.engine.render(['你好'], '', self.config)
+        await self.engine.render(['你好'], self.config)
         self.assertEqual(self.calls[0][0]['messages'][0]['content'], base)
 
-    async def test_style_never_changes_fixed_prompt(self):
-        prompt = self.engine._build_prompt(self.config['voice']['clone_prompt'], '温柔安慰')
-        self.assertEqual(prompt, '用原本的音色和语气说话，保持自然流畅')
+    async def test_custom_fixed_prompt_is_verbatim(self):
+        self.config['voice']['clone_prompt'] = '固定声音要求'
+        await self.engine.render(['你好'], self.config)
+        self.assertEqual(self.calls[0][0]['messages'][0]['content'], '固定声音要求')
 
     async def test_clone_and_segment_order(self):
         self.config['mimo']['synthesis_mode'] = 'voiceclone'
         self.engine.reference = AsyncMock(return_value='data:audio/wav;base64,ref')
         self.engine.merge = AsyncMock(return_value=b'merged')
-        self.assertEqual(await self.engine.render(['第一句', '第二句'], '', self.config), b'merged')
+        self.assertEqual(await self.engine.render(['第一句', '第二句'], self.config), b'merged')
         self.assertEqual([c[0]['messages'][1]['content'] for c in self.calls], ['第一句', '第二句'])
         self.assertEqual(self.calls[0][0]['audio']['voice'], 'data:audio/wav;base64,ref')
 
     async def test_errors_are_not_retried_or_leaked(self):
         self.status = 401
         with self.assertRaisesRegex(SpeechError, '^MiMo HTTP 401$'):
-            await self.engine.render(['你好'], '', self.config)
+            await self.engine.render(['你好'], self.config)
         self.assertEqual(len(self.calls), 1)
         self.status = 200
         self.invalid = True
         with self.assertRaisesRegex(SpeechError, 'invalid_audio_base64'):
-            await self.engine.render(['你好'], '', self.config)
+            await self.engine.render(['你好'], self.config)
 
     async def test_transient_retries_keep_body_and_return_audio(self):
         self.statuses = [429, 503, 200]
         with patch('audio.asyncio.sleep', new_callable=AsyncMock) as sleep:
-            self.assertEqual(await self.engine.render(['你好'], '开心', self.config), self.audio)
+            self.assertEqual(await self.engine.render(['你好'], self.config), self.audio)
         self.assertEqual([c.args[0] for c in sleep.await_args_list], [2, 4])
         self.assertEqual(self.calls, [self.calls[0]] * 3)
 
@@ -103,13 +104,13 @@ class TransportTests(IsolatedAsyncioTestCase):
         self.status = 429
         with patch('audio.asyncio.sleep', new_callable=AsyncMock):
             with self.assertRaisesRegex(SpeechError, '^MiMo HTTP 429$'):
-                await self.engine.render(['你好'], '', self.config)
+                await self.engine.render(['你好'], self.config)
         self.assertEqual(len(self.calls), 3)
 
     async def test_empty_success_recovers_without_changing_text(self):
         self.empty_once = True
         with patch('audio.asyncio.sleep', new_callable=AsyncMock):
-            self.assertEqual(await self.engine.render(['你好'], '', self.config), self.audio)
+            self.assertEqual(await self.engine.render(['你好'], self.config), self.audio)
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.calls[0], self.calls[1])
 
@@ -119,6 +120,6 @@ class TransportTests(IsolatedAsyncioTestCase):
             self.payload = {'choices': [{'finish_reason': reason, 'message': {'content': 'private diagnostic'}}]}
             with patch('audio.asyncio.sleep', new_callable=AsyncMock):
                 with self.assertRaisesRegex(SpeechError, expected) as error:
-                    await self.engine.render(['你好'], '', self.config)
+                    await self.engine.render(['你好'], self.config)
             self.assertNotIn('private', str(error.exception))
             self.assertEqual(len(self.calls), 2 if reason == 'stop' else 1)
