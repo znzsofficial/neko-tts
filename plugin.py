@@ -20,7 +20,7 @@ except ImportError:
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.5.1")
+    config_version: str = Field(default="0.6.0")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -145,23 +145,50 @@ class NekoTTS(MaiBotPlugin):
         if phase != "before_send":
             return {}
         try:
-            # Use actually generated text segments, excluding mentions/quotes/media.
-            spoken = "\n".join(segment['data'] for message in (messages or [])
-                               for segment in message.get('segments', [])
-                               if segment.get('type') == 'text' and isinstance(segment.get('data'), str))
+            # These are Host post-processed messages, not the unsplit replyer
+            # text. Keep their boundaries all the way through synthesis/send.
+            speech = []
+            total_length = total_chunks = 0
+            config = self.config.general.model_dump()
+            for index, message in enumerate(messages or []):
+                spoken = ''.join(segment['data'] for segment in message.get('segments', [])
+                                 if segment.get('type') == 'text' and isinstance(segment.get('data'), str)).strip()
+                if not spoken:
+                    continue
+                chunks = split_text(spoken, config)
+                total_length += sum(len(chunk) for chunk in chunks)
+                total_chunks += len(chunks)
+                speech.append((index, spoken))
+            if not speech:
+                return {}
+            if total_length > config['max_total_length'] or total_chunks > config['max_segments']:
+                raise ValueError('整条回复超过语音长度或段数限制')
             if self.config.output.mode == "text_then_voice":
                 stream_id = str(kwargs.get("session_id") or "").strip()
                 if not stream_id:
                     raise ValueError("无法获取当前聊天")
-                self._pending.setdefault(stream_id, []).append(
-                    (spoken, time.monotonic() + 180)
-                )
+                now = time.monotonic()
+                pending = [item for item in self._pending.get(stream_id, []) if item[1] > now]
+                pending.extend((spoken, now + 180) for _, spoken in speech)
+                self._pending[stream_id] = pending
                 return {"messages": deepcopy(messages)}
 
-            audio = await self._render(spoken)
+            generation = self._generation
+            voices = {}
+            # Whole-reply deadline, not a fresh timeout for every short message.
+            # Prepare all audio first: a later failure leaves the entire reply
+            # intact, rather than leaking a partially transformed message list.
+            async with asyncio.timeout(config['timeout']):
+                for index, spoken in speech:
+                    audio = await self._render(spoken)
+                    if generation != self._generation:
+                        raise ValueError('配置已更新，请重新调用')
+                    voices[index] = voice_message(audio)
             if self.config.output.mode == "voice_only":
-                return {"messages": [voice_message(audio)]}
-            return {"messages": deepcopy(messages) + [voice_message(audio)]}
+                return {"messages": list(voices.values())}
+            # Keep original indices/quote chains intact: inserting audio
+            # between text messages would change what quote_previous targets.
+            return {"messages": deepcopy(messages) + list(voices.values())}
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -208,7 +235,7 @@ class NekoTTS(MaiBotPlugin):
         if self.config.output.mode != "text_then_voice":
             return None
         stream_id = str(kwargs.get("stream_id") or (message or {}).get("session_id") or "").strip()
-        text = "\n".join(
+        text = "".join(
             str(item.get("data") or "")
             for item in (message or {}).get("raw_message", [])
             if isinstance(item, dict) and item.get("type") == "text"

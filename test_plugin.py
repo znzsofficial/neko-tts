@@ -69,6 +69,77 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(result['messages']), 1)
         self.assertEqual(result['messages'][0]['segments'][0]['type'], 'voice')
 
+    async def test_host_split_messages_render_and_send_separately(self):
+        messages = [
+            {'segments': [{'type': 'text', 'data': '第一句'}], 'quote_previous': True},
+            self.messages[1],
+            {'segments': [{'type': 'at', 'data': 'someone'}, {'type': 'text', 'data': '第二句'}], 'quote_previous': False},
+        ]
+        original = deepcopy(messages)
+        self.p._render.side_effect = [b'first-audio', b'second-audio']
+        result = await self.p.voice_reply_extension(phase='before_send', text='断句前整句不要朗读', messages=messages)
+        self.assertEqual([call.args for call in self.p._render.await_args_list], [('第一句',), ('第二句',)])
+        out = result['messages']
+        self.assertEqual(out[:3], original)
+        self.assertEqual([out[i]['segments'][0]['type'] for i in [3, 4]], ['voice', 'voice'])
+        self.assertEqual([base64.b64decode(out[i]['segments'][0]['binary_data_base64']) for i in [3, 4]], [b'first-audio', b'second-audio'])
+        self.assertEqual(messages, original)
+
+    async def test_voice_only_keeps_host_split_boundaries(self):
+        self.p.config.output.mode = 'voice_only'
+        messages = [self.messages[0], {'segments': [{'type': 'text', 'data': '第二句'}], 'quote_previous': False}]
+        result = await self.p.voice_reply_extension(phase='before_send', messages=messages)
+        self.assertEqual(len(result['messages']), 2)
+        self.assertTrue(all(m['segments'][0]['type'] == 'voice' and not m['quote_previous'] for m in result['messages']))
+
+    async def test_second_segment_failure_keeps_entire_original_reply(self):
+        messages = [self.messages[0], {'segments': [{'type': 'text', 'data': '第二句'}], 'quote_previous': False}]
+        original = deepcopy(messages)
+        self.p._render.side_effect = [b'first', RuntimeError('failed')]
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=messages), {})
+        self.assertEqual(messages, original)
+        self.p.ctx.send.custom.assert_not_called()
+
+    async def test_whole_reply_limits_apply_across_host_messages(self):
+        self.p.config.general.max_total_length = 50
+        messages = [{'segments': [{'type': 'text', 'data': 'a' * 30}], 'quote_previous': False} for _ in range(2)]
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=messages), {})
+        self.p._render.assert_not_called()
+        self.p.config.general.max_total_length = 2000
+        self.p.config.general.max_segments = 1
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=messages), {})
+        self.p._render.assert_not_called()
+
+    async def test_whole_reply_deadline_and_reload_preserve_original(self):
+        messages = [self.messages[0], {'segments': [{'type': 'text', 'data': '第二句'}], 'quote_previous': False}]
+        async def slow(text):
+            await asyncio.sleep(.02)
+            return b'audio'
+        self.p._render.side_effect = slow
+        timeout = asyncio.timeout
+        with patch('plugin.asyncio.timeout', side_effect=lambda seconds: timeout(.03)):
+            self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=messages), {})
+        async def reloaded(text):
+            self.p._generation += 1
+            return b'audio'
+        self.p._render.side_effect = reloaded
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=messages), {})
+
+    async def test_background_matches_each_host_message_without_rejoining(self):
+        self.p.config.output.mode = 'text_then_voice'
+        messages = [self.messages[0], {'segments': [{'type': 'text', 'data': '第二句'}], 'quote_previous': False}]
+        await self.p.voice_reply_extension(phase='before_send', messages=messages, session_id='chat-a')
+        self.assertEqual([item[0] for item in self.p._pending['chat-a']], ['你好', '第二句'])
+        self.p._background_voice = AsyncMock()
+        for text in ['你好', '第二句']:
+            await self.p.after_text_send(message={'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': text}]}, sent=True)
+        await asyncio.sleep(0)
+        self.assertEqual([call.args for call in self.p._background_voice.await_args_list], [('你好', 'chat-a'), ('第二句', 'chat-a')])
+
+    async def test_attachment_only_is_unchanged(self):
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=[self.messages[1]]), {})
+        self.p._render.assert_not_called()
+
     async def test_text_then_voice_registers_without_synthesizing(self):
         self.p.config.output.mode = 'text_then_voice'
         result = await self.p.voice_reply_extension(phase='before_send',
