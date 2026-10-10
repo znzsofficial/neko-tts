@@ -6,6 +6,7 @@ import base64
 from copy import deepcopy
 import random
 import time
+from pathlib import Path
 from typing import Literal
 
 from maibot_sdk import (CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler,
@@ -14,13 +15,15 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 try:
     from .audio import SpeechEngine, SpeechError, split_text, voice_message
+    from .history_visibility import VoiceVisibility
 except ImportError:
     from audio import SpeechEngine, SpeechError, split_text, voice_message
+    from history_visibility import VoiceVisibility
 
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.6.0")
+    config_version: str = Field(default="0.6.1")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -85,9 +88,15 @@ class NekoTTS(MaiBotPlugin):
         self._generation = 0
         self._ready = False
         self._pending: dict[str, list[tuple[str, float]]] = {}
+        self._visibility = VoiceVisibility()
 
     async def on_load(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
+        self._visibility = VoiceVisibility(Path(self.ctx.paths.runtime_dir) / 'voice-receipts.json')
+        try:
+            self._visibility.load()
+        except ValueError as exc:
+            self.ctx.logger.warning('%s', str(exc))
         self._ready = True
         self.ctx.logger.info("Neko TTS 已加载：固定提示；mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
@@ -102,6 +111,7 @@ class NekoTTS(MaiBotPlugin):
         if self._engine:
             await self._engine.close()
         self._pending.clear()
+        self._visibility.pending.clear()
 
     async def on_unload(self):
         await self._reset()
@@ -185,9 +195,15 @@ class NekoTTS(MaiBotPlugin):
                         raise ValueError('配置已更新，请重新调用')
                     voices[index] = voice_message(audio)
             if self.config.output.mode == "voice_only":
+                scope = str(kwargs.get('session_id') or '').strip()
+                for voice in voices.values():
+                    self._visibility.remember_audio(scope, base64.b64decode(voice['segments'][0]['binary_data_base64']))
                 return {"messages": list(voices.values())}
             # Keep original indices/quote chains intact: inserting audio
             # between text messages would change what quote_previous targets.
+            scope = str(kwargs.get('session_id') or '').strip()
+            for voice in voices.values():
+                self._visibility.remember_audio(scope, base64.b64decode(voice['segments'][0]['binary_data_base64']))
             return {"messages": deepcopy(messages) + list(voices.values())}
         except asyncio.CancelledError:
             raise
@@ -232,9 +248,14 @@ class NekoTTS(MaiBotPlugin):
         """For text_then_voice, queue the exact delivered reply for background speech."""
         if not sent or not self._ready or not self.config.plugin.enabled:
             return None
+        stream_id = str(kwargs.get("stream_id") or (message or {}).get("session_id") or "").strip()
+        if self._visibility.observe(stream_id, message, sent):
+            try:
+                self._visibility.save()
+            except OSError:
+                self.ctx.logger.warning('Neko TTS 语音回执保存失败，当前会话过滤仍有效')
         if self.config.output.mode != "text_then_voice":
             return None
-        stream_id = str(kwargs.get("stream_id") or (message or {}).get("session_id") or "").strip()
         text = "".join(
             str(item.get("data") or "")
             for item in (message or {}).get("raw_message", [])
@@ -261,12 +282,29 @@ class NekoTTS(MaiBotPlugin):
         task.add_done_callback(self._tasks.discard)
         return None
 
+    def _visible_prompt(self, items, session_id, kwargs):
+        kept = self._visibility.filter_items(items, session_id)
+        if kept is items or kept == items:
+            return None
+        return {'action': 'continue', 'modified_kwargs': dict(kwargs, items=kept, session_id=session_id)}
+
+    @HookHandler('maisaka.planner.before_request', name='neko_tts_hide_planner_voice',
+                 mode=HookMode.BLOCKING, order=HookOrder.LATE, error_policy=ErrorPolicy.SKIP)
+    async def hide_planner_voice(self, items=None, session_id='', **kwargs):
+        return self._visible_prompt(items, session_id, kwargs)
+
+    @HookHandler('maisaka.replyer.before_model_request', name='neko_tts_hide_replyer_voice',
+                 mode=HookMode.BLOCKING, order=HookOrder.LATE, error_policy=ErrorPolicy.SKIP)
+    async def hide_replyer_voice(self, items=None, session_id='', **kwargs):
+        return self._visible_prompt(items, session_id, kwargs)
+
     async def _background_voice(self, text: str, stream_id: str) -> None:
         try:
             audio = await self._render(text)
+            self._visibility.remember_audio(stream_id, audio)
             sent = await self.ctx.send.custom(
                 "voice", base64.b64encode(audio).decode("ascii"), stream_id,
-                processed_plain_text=text, sync_to_maisaka_history=False,
+                processed_plain_text='', storage_message=False, sync_to_maisaka_history=False,
                 maisaka_source_kind="neko_tts",
             )
             if not sent:
@@ -292,8 +330,9 @@ class NekoTTS(MaiBotPlugin):
             return False, "用法：/neko-tts <文本>", True
         try:
             audio = await self._render(text)
+            self._visibility.remember_audio(stream_id, audio)
             sent = await self.ctx.send.custom('voice', base64.b64encode(audio).decode('ascii'), stream_id,
-                                             processed_plain_text=text, sync_to_maisaka_history=True,
+                                             processed_plain_text='', storage_message=False, sync_to_maisaka_history=False,
                                              maisaka_source_kind='tool_voice')
             return bool(sent), "语音已发送" if sent else "语音发送失败", True
         except asyncio.CancelledError:

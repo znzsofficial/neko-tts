@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase, TestCase
@@ -62,6 +63,28 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertFalse(result['messages'][-1]['quote_previous'])
         self.p._render.assert_awaited_once_with('你好')
         self.p.ctx.send.custom.assert_not_called()
+
+    async def test_tts_receipt_removed_from_both_model_prompts(self):
+        result = await self.p.voice_reply_extension(phase='before_send', messages=self.messages, session_id='chat-a')
+        voice = result['messages'][-1]['segments'][0]
+        self.assertEqual(voice['hash'], hashlib.sha256(b'audio').hexdigest())
+        await self.p.after_text_send(message={'session_id': 'chat-a', 'message_id': '123', 'raw_message': [voice]}, sent=True)
+        own = {'item_type': 'UserMessageItem', 'parts': [{'text': '<message msg_id="123">\n'}, {'text': '[语音消息]'}]}
+        user = {'item_type': 'UserMessageItem', 'parts': [{'text': '<message msg_id="124">\n'}, {'text': '用户语音正文'}]}
+        for handler in [self.p.hide_planner_voice, self.p.hide_replyer_voice]:
+            change = await handler(items=[own, user], session_id='chat-a', item_schema_version=1, other='preserved')
+            self.assertEqual(change['modified_kwargs']['items'], [user])
+            self.assertEqual(change['modified_kwargs']['other'], 'preserved')
+
+    async def test_direct_and_background_voice_do_not_sync_history(self):
+        self.p.config.command.allowed_user_ids = ['owner']
+        await self.p.command(stream_id='chat-a', user_id='owner', matched_groups={'text': 'test'})
+        options = self.p.ctx.send.custom.call_args.kwargs
+        self.assertFalse(options['sync_to_maisaka_history'])
+        self.assertFalse(options['storage_message'])
+        await self.p._background_voice('test', 'chat-a')
+        self.assertFalse(self.p.ctx.send.custom.call_args.kwargs['sync_to_maisaka_history'])
+        self.assertFalse(self.p.ctx.send.custom.call_args.kwargs['storage_message'])
 
     async def test_voice_only_drops_text_but_keeps_one_voice(self):
         self.p.config.output.mode = 'voice_only'

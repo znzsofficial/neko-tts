@@ -74,6 +74,7 @@ def split_text(text, config):
 
 def voice_message(audio):
     return {'segments': [{'type': 'voice', 'data': '',
+                          'hash': hashlib.sha256(audio).hexdigest(),
                           'binary_data_base64': base64.b64encode(audio).decode('ascii')}],
             'quote_previous': False}
 
