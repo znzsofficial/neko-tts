@@ -51,9 +51,53 @@ class VisibilityTests(TestCase):
         self.v.remember_audio('chat-a', self.audio)
         self.v.remember_audio('chat-a', self.audio)
         self.assertTrue(self.observe(message_id='123'))
+        self.assertFalse(self.observe(message_id='123'))
         self.assertTrue(self.observe(message_id='124'))
         self.assertFalse(self.observe(message_id='125'))
         self.assertEqual(len(self.v.ids), 2)
+
+    def test_legacy_cache_migrates_to_persistent_path_without_deleting_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            legacy = Path(temp) / 'runtime' / 'voice-receipts.json'
+            self.v.path = legacy
+            self.v.remember_audio('chat-a', self.audio)
+            self.observe()
+            self.v.save()
+            original = legacy.read_bytes()
+            persistent = Path(temp) / 'data' / 'voice-receipts.json'
+            migrated = VoiceVisibility(persistent, clock=lambda: self.now[0])
+            migrated.load_with_legacy(legacy)
+            self.assertEqual(migrated.ids, self.v.ids)
+            self.assertEqual(legacy.read_bytes(), original)
+            self.assertTrue(persistent.exists())
+            # New cache wins; stale legacy data must never overwrite it.
+            persistent.write_text('[]', encoding='utf-8')
+            current = VoiceVisibility(persistent, clock=lambda: self.now[0])
+            current.load_with_legacy(legacy)
+            self.assertEqual(current.ids, {})
+
+    def test_extreme_invalid_expiry_is_safe_and_preserves_file(self):
+        for value in [10 ** 1000, float('inf'), float('nan')]:
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / 'voice-receipts.json'
+                original = json.dumps([['chat-a', '123', value]])
+                path.write_text(original, encoding='utf-8')
+                cache = VoiceVisibility(path)
+                with self.assertRaises(ValueError):
+                    cache.load()
+                cache.save()
+                self.assertEqual(path.read_text(encoding='utf-8'), original)
+
+    def test_cache_byte_limit_compacts_oldest_not_newest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.v.path = Path(temp) / 'voice-receipts.json'
+            self.v.MAX_CACHE_BYTES = 150
+            for message_id in ['1' * 50, '2' * 50, '3' * 50]:
+                self.v.remember_audio('chat-a', self.audio)
+                self.observe(message_id=message_id)
+            self.v.save()
+            self.assertLessEqual(self.v.path.stat().st_size, 150)
+            self.assertIn(('chat-a', '3' * 50), self.v.ids)
 
     def test_historical_empty_self_voice_placeholder_only(self):
         old = item('old', self_message=True)

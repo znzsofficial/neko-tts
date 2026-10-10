@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "neko.tts",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "name": "Neko TTS",
   "description": "固定提示 MiMo 语音；支持 Planner 主动选择和随机＋主动混合模式。",
   "author": { "name": "NekoLaska", "url": "https://github.com/znzsofficial" },

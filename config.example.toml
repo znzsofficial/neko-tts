@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "0.6.1"
+config_version = "0.6.2"
 
 [general]
 timeout = 120

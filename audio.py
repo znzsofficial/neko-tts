@@ -20,7 +20,7 @@ class SpeechError(RuntimeError):
 def decode_response(raw):
     try:
         payload = json.loads(raw)
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         raise SpeechError('MiMo invalid_json') from None
     choices = payload.get('choices') if isinstance(payload, dict) else None
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):

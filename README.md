@@ -1,4 +1,4 @@
-# Neko TTS 0.6.1
+# Neko TTS 0.6.2
 
 独立的 MaiBot 语音插件。固定合成提示，支持仅主动选择或**随机＋主动选择混合模式**，没有“默认语音、文字例外”。支持 MiMo 音色克隆与预置音色。
 
@@ -30,7 +30,7 @@ git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
 
 0.6.1起，TTS实际合成的音频哈希与成功发送回执关联，记下当前聊天的真实消息编号。在Planner和Replyer发起模型请求前，只排除这些语音消息的Context Items；不按正文去重，不删除文字、不屏蔽用户语音或其他插件的有内容消息。旧历史中明确标记自身且仅包含“[语音消息]”的空占位也被过滤。发送路径、断句、固定提示和混合概率保持不变。
 
-宿主仍会存储text_and_voice/voice_only的发送记录，WebUI里可能仍看得到；过滤的是模型输入，不是删除数据库或清空聊天。reply的工具调用记录（包括plugin_options）也不删除。直接测试命令和后台语音关闭storage_message与sync_to_maisaka_history。回执缓存仅聊天ID/消息ID/有效期，无音频或正文；上限4096条、保留7天，原子0600写入runtime_dir/voice-receipts.json，重载后继续使用；损坏文件保留不覆盖。过期/超容量的有正文旧语音不保证过滤，旧空占位不依赖缓存。宿主前缀/短消息ID别名格式变化需重新适配；当前MaiBot1.3.5链路已验证。
+宿主仍会存储text_and_voice/voice_only的发送记录，WebUI里可能仍看得到；过滤的是模型输入，不是删除数据库或清空聊天。reply的工具调用记录（包括plugin_options）也不删除。直接测试命令和后台语音关闭storage_message与sync_to_maisaka_history。回执缓存仅聊天ID/消息ID/有效期，无音频或正文；上限4096条/2MiB、保留7天，原子0600写入持久data_dir/voice-receipts.json。0.6.2首次启动从旧runtime_dir缓存迁移且保留旧文件，不覆盖已有持久缓存；损坏或极端数据保留不覆盖。重复回执不消耗其他语音的匹配次数。过期/超容量的有正文旧语音不保证过滤，旧空占位不依赖缓存。宿主前缀/短消息ID别名格式变化需重新适配；当前MaiBot1.3.5链路已验证。
 
 ## 发送与失败
 
@@ -47,6 +47,8 @@ git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
 MiMo 返回 429/502/503/504 时最多退避重试两次；第一次请求 `finish_reason=stop` 但缺少音频时最多重试一次。均受整轮超时限制，重试不修改正文或提示词。内容拦截、截断结果、未知结构、鉴权失败和网络超时不自动重试。平台发送失败不自动重试。
 
 合成失败或超过文本限制会保留原回复。日志对 MiMo 错误记录安全的状态原因（如 `HTTP 429`、`missing_audio`），其他异常只记录类型，不记录密钥、聊天正文或原始响应。后台平台发送返回失败也会记录日志。
+
+单段音频最多8MiB，整组扩展结果JSON最多12MiB，为宿主16MiB RPC帧预留开销；超过时回退原回复，不交给宿主发送无法传输的语音组。命令和后台路径也受单段限制。
 
 ## 合成配置
 

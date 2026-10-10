@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 from copy import deepcopy
 import random
 import time
@@ -23,7 +24,7 @@ except ImportError:
 
 class PluginSection(PluginConfigBase):
     enabled: bool = Field(default=False, description="启用插件；上线前停用其他自动 TTS 插件")
-    config_version: str = Field(default="0.6.1")
+    config_version: str = Field(default="0.6.2")
 
 
 class GeneralConfig(PluginConfigBase):
@@ -92,11 +93,11 @@ class NekoTTS(MaiBotPlugin):
 
     async def on_load(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
-        self._visibility = VoiceVisibility(Path(self.ctx.paths.runtime_dir) / 'voice-receipts.json')
+        self._visibility = VoiceVisibility(Path(self.ctx.paths.data_dir) / 'voice-receipts.json')
         try:
-            self._visibility.load()
-        except ValueError as exc:
-            self.ctx.logger.warning('%s', str(exc))
+            self._visibility.load_with_legacy(Path(self.ctx.paths.runtime_dir) / 'voice-receipts.json')
+        except (ValueError, OSError):
+            self.ctx.logger.warning('Neko TTS 语音回执缓存读取或迁移失败，已保留原文件')
         self._ready = True
         self.ctx.logger.info("Neko TTS 已加载：固定提示；mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
@@ -185,6 +186,9 @@ class NekoTTS(MaiBotPlugin):
 
             generation = self._generation
             voices = {}
+            rpc_bytes = len(json.dumps(messages, ensure_ascii=False).encode('utf-8')) if self.config.output.mode != 'voice_only' else 2
+            if rpc_bytes > 12 * 1024 * 1024:
+                raise ValueError('原回复已超过语音扩展传输预算')
             # Whole-reply deadline, not a fresh timeout for every short message.
             # Prepare all audio first: a later failure leaves the entire reply
             # intact, rather than leaking a partially transformed message list.
@@ -193,18 +197,24 @@ class NekoTTS(MaiBotPlugin):
                     audio = await self._render(spoken)
                     if generation != self._generation:
                         raise ValueError('配置已更新，请重新调用')
-                    voices[index] = voice_message(audio)
-            if self.config.output.mode == "voice_only":
-                scope = str(kwargs.get('session_id') or '').strip()
-                for voice in voices.values():
-                    self._visibility.remember_audio(scope, base64.b64decode(voice['segments'][0]['binary_data_base64']))
-                return {"messages": list(voices.values())}
+                    if len(audio) > 8 * 1024 * 1024:
+                        raise ValueError('语音单段超过安全传输大小')
+                    voice = voice_message(audio)
+                    rpc_bytes += len(json.dumps(voice, ensure_ascii=False).encode('utf-8')) + 1
+                    if rpc_bytes > 12 * 1024 * 1024:
+                        raise ValueError('语音回复超过安全传输大小')
+                    voices[index] = voice
+            result = list(voices.values()) if self.config.output.mode == 'voice_only' else deepcopy(messages) + list(voices.values())
+            # Host RPC max frame is 16MiB. Reserve envelope overhead and avoid
+            # handing the Host a successful-but-unsendable audio batch.
+            if len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > 12 * 1024 * 1024:
+                raise ValueError('语音回复超过安全传输大小')
             # Keep original indices/quote chains intact: inserting audio
             # between text messages would change what quote_previous targets.
             scope = str(kwargs.get('session_id') or '').strip()
             for voice in voices.values():
                 self._visibility.remember_audio(scope, base64.b64decode(voice['segments'][0]['binary_data_base64']))
-            return {"messages": deepcopy(messages) + list(voices.values())}
+            return {"messages": result}
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -301,6 +311,8 @@ class NekoTTS(MaiBotPlugin):
     async def _background_voice(self, text: str, stream_id: str) -> None:
         try:
             audio = await self._render(text)
+            if len(audio) > 8 * 1024 * 1024:
+                raise ValueError('语音超过安全传输大小')
             self._visibility.remember_audio(stream_id, audio)
             sent = await self.ctx.send.custom(
                 "voice", base64.b64encode(audio).decode("ascii"), stream_id,
@@ -330,6 +342,8 @@ class NekoTTS(MaiBotPlugin):
             return False, "用法：/neko-tts <文本>", True
         try:
             audio = await self._render(text)
+            if len(audio) > 8 * 1024 * 1024:
+                raise ValueError('语音超过安全传输大小')
             self._visibility.remember_audio(stream_id, audio)
             sent = await self.ctx.send.custom('voice', base64.b64encode(audio).decode('ascii'), stream_id,
                                              processed_plain_text='', storage_message=False, sync_to_maisaka_history=False,

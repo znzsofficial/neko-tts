@@ -15,6 +15,7 @@ from pathlib import Path
 class VoiceVisibility:
     MAX_IDS = 4096
     MAX_PENDING = 256
+    MAX_CACHE_BYTES = 2 * 1024 * 1024
     TTL = 7 * 86400
     PENDING_TTL = 300
 
@@ -29,7 +30,7 @@ class VoiceVisibility:
         if self.path is None or not self.path.exists():
             return
         try:
-            if self.path.stat().st_size > 2 * 1024 * 1024:
+            if self.path.stat().st_size > self.MAX_CACHE_BYTES:
                 raise ValueError('receipt cache too large')
             raw = json.loads(self.path.read_text(encoding='utf-8'))
             if not isinstance(raw, list) or len(raw) > self.MAX_IDS:
@@ -38,14 +39,24 @@ class VoiceVisibility:
                 if (not isinstance(row, list) or len(row) != 3 or
                         not isinstance(row[0], str) or not 0 < len(row[0]) <= 128 or
                         not isinstance(row[1], str) or not 0 < len(row[1]) <= 256 or
-                        isinstance(row[2], bool) or not isinstance(row[2], (float, int)) or not math.isfinite(row[2])):
+                        isinstance(row[2], bool) or not isinstance(row[2], (float, int)) or
+                        row[2] > self.clock() + self.TTL + 3600 or not math.isfinite(row[2])):
                     raise ValueError('invalid receipt cache')
                 if row[2] > self.clock():
                     self.ids[(row[0], row[1])] = row[2]
-        except (OSError, ValueError, UnicodeError):
+        except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
             self.ids.clear()
             self.healthy_file = False
             raise ValueError('语音回执缓存无法读取，已保留原文件') from None
+
+    def load_with_legacy(self, legacy_path):
+        self.load()
+        if self.path is None or self.path.exists() or not Path(legacy_path).exists():
+            return
+        legacy = VoiceVisibility(legacy_path, clock=self.clock)
+        legacy.load()
+        self.ids.update(legacy.ids)
+        self.save()  # Keep the old file intact, never overwrite a new cache.
 
     def remember_audio(self, scope, audio):
         if not scope:
@@ -76,6 +87,8 @@ class VoiceVisibility:
         if not isinstance(message_id, str) or not 0 < len(message_id) <= 256:
             return False
         self._prune()
+        if (scope, message_id) in self.ids:
+            return False  # A repeated delivery hook must not consume another clip.
         key = (scope, digest)
         entry = self.pending.get(key)
         if entry is None:
@@ -103,12 +116,18 @@ class VoiceVisibility:
         if self.path is None or not self.healthy_file:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._prune()
         rows = [[scope, message_id, expires] for (scope, message_id), expires in self.ids.items()]
+        encoded = json.dumps(rows, ensure_ascii=False)
+        while len(encoded.encode('utf-8')) > self.MAX_CACHE_BYTES and rows:
+            self.ids.popitem(last=False)
+            rows.pop(0)
+            encoded = json.dumps(rows, ensure_ascii=False)
         fd, name = tempfile.mkstemp(prefix='.voice-receipts-', dir=self.path.parent)
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as stream:
                 os.chmod(name, 0o600)
-                json.dump(rows, stream, ensure_ascii=False)
+                stream.write(encoded)
             os.replace(name, self.path)
         finally:
             if os.path.exists(name):

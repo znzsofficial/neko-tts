@@ -86,6 +86,25 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertFalse(self.p.ctx.send.custom.call_args.kwargs['sync_to_maisaka_history'])
         self.assertFalse(self.p.ctx.send.custom.call_args.kwargs['storage_message'])
 
+    async def test_oversized_audio_preserves_original_and_no_receipts(self):
+        self.p._render.return_value = b'x' * (8 * 1024 * 1024 + 1)
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=self.messages, session_id='chat-a'), {})
+        self.assertFalse(self.p._visibility.pending)
+        self.p.ctx.send.custom.assert_not_called()
+
+    async def test_audio_batch_rpc_budget_preserves_original(self):
+        self.p._render.return_value = b'x' * (5 * 1024 * 1024)
+        messages = [self.messages[0], self.messages[0]]
+        self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=messages, session_id='chat-a'), {})
+        self.assertFalse(self.p._visibility.pending)
+
+    async def test_oversized_command_audio_is_never_sent(self):
+        self.p.config.command.allowed_user_ids = ['owner']
+        self.p._render.return_value = b'x' * (8 * 1024 * 1024 + 1)
+        result = await self.p.command(stream_id='chat-a', user_id='owner', matched_groups={'text': 'test'})
+        self.assertFalse(result[0])
+        self.p.ctx.send.custom.assert_not_called()
+
     async def test_voice_only_drops_text_but_keeps_one_voice(self):
         self.p.config.output.mode = 'voice_only'
         result = await self.p.voice_reply_extension(phase='before_send', messages=self.messages)
