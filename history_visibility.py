@@ -146,6 +146,14 @@ class VoiceVisibility:
         kept = []
         for item in items:
             hidden = False
+            if isinstance(item, dict) and item.get('item_type') == 'AssistantMessageItem':
+                # Replyer rebuilds guided bot history as Assistant Items and
+                # drops platform IDs/prefixes. Only its empty voice placeholder
+                # can safely be recognized here; never strip mixed text.
+                parts = item.get('parts')
+                hidden = (isinstance(parts, list) and len(parts) == 1 and
+                          isinstance(parts[0], dict) and parts[0].get('type') == 'text' and
+                          parts[0].get('text') == '[语音消息]')
             if isinstance(item, dict) and item.get('item_type') == 'UserMessageItem':
                 parts = item.get('parts')
                 first = parts[0] if isinstance(parts, list) and parts else None

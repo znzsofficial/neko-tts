@@ -170,6 +170,16 @@ class VisibilityTests(TestCase):
         speech = item('other', 'meaningful speech', self_message=True)
         self.assertEqual(self.v.filter_items([old, user, speech], 'chat-a'), [user, speech])
 
+    def test_replyer_idless_assistant_placeholder_only(self):
+        own = {'item_type': 'AssistantMessageItem', 'parts': [{'type': 'text', 'text': '[语音消息]'}]}
+        user = dict(own, item_type='UserMessageItem')
+        literal = {'item_type': 'AssistantMessageItem', 'parts': [{'type': 'text', 'text': '我看到了[语音消息]'}]}
+        transcript = {'item_type': 'AssistantMessageItem', 'parts': [{'type': 'text', 'text': '[语音: 有内容]'}]}
+        mixed = dict(own, parts=own['parts'] + [{'type': 'image', 'url': 'keep'}])
+        source = [own, user, literal, transcript, mixed]
+        self.assertEqual(self.v.filter_items(source, 'chat-a'), [user, literal, transcript, mixed])
+        self.assertEqual(source[0], own)
+
     def test_do_not_parse_ids_in_tool_results_or_quoted_user_body(self):
         self.v.remember_audio('chat-a', self.audio)
         self.observe()
