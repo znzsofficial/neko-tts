@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from unittest import TestCase
 
-from history_visibility import VoiceVisibility
+from history_visibility import ReplyReceiptVisibility, VoiceVisibility
 
 
 def item(message_id, body='[语音消息]', *, chat='', self_message=False, kind='UserMessageItem'):
@@ -16,6 +16,71 @@ def item(message_id, body='[语音消息]', *, chat='', self_message=False, kind
         attrs += ' is_self_message="true"'
     return {'item_type': kind, 'meta': {'item_id': 'context-' + message_id},
             'parts': [{'text': '<message ' + attrs + '>\n'}, {'text': body}]}
+
+
+def receipt(body, call_id='call-1', **kwargs):
+    return dict(item_type='FunctionCallOutputItem', meta={'item_id': 'tool-1'}, call_id=call_id,
+                tool_name='reply', success=True, output='"麦麦"已生成并向"用户"发送了回复"' + body + '"', **kwargs)
+
+
+class ReplyReceiptTests(TestCase):
+    def setUp(self):
+        self.v = ReplyReceiptVisibility(clock=lambda: 1000)
+        self.v.remember('chat', 'call-1', 2, 'text_and_voice')
+
+    def test_strip_exact_appended_clips_keep_original_literal_and_identity(self):
+        source = receipt('文字' + '[语音消息]' * 4)
+        cleaned = self.v.filter_items([source], 'chat')[0]
+        self.assertEqual(cleaned['output'], receipt('文字[语音消息][语音消息]')['output'])
+        self.assertEqual(cleaned['meta'], source['meta'])
+        self.assertEqual(cleaned['call_id'], source['call_id'])
+        self.assertEqual(source['output'].count('[语音消息]'), 4)
+        self.assertEqual(self.v.filter_items([cleaned], 'chat'), [cleaned])
+
+    def test_unrelated_user_tools_failed_and_other_chat_untouched(self):
+        source = [receipt('文字[语音消息][语音消息]', call_id='unknown'),
+                  item('u', '[语音消息]'),
+                  dict(receipt('[语音消息][语音消息]'), tool_name='search'),
+                  dict(receipt('[语音消息][语音消息]'), success=False),
+                  receipt('正文里[语音消息]但末尾没有'),
+                  dict(receipt('[语音消息][语音消息]'), output='[语音消息][语音消息]')]
+        self.assertEqual(self.v.filter_items(source, 'chat'), source)
+        own = receipt('[语音消息][语音消息]')
+        self.assertEqual(self.v.filter_items([own], 'other'), [own])
+
+    def test_voice_only_keeps_tool_result_without_audio_marker(self):
+        self.v.remember('chat', 'call-1', 2, 'voice_only')
+        self.assertEqual(self.v.filter_items([receipt('[语音消息]' * 2)], 'chat')[0]['output'], '回复已发送。')
+        mixed = receipt('文字[语音消息][语音消息]')
+        self.assertEqual(self.v.filter_items([mixed], 'chat'), [mixed])
+
+    def test_current_chat_receipt_and_quotes_in_body(self):
+        source = dict(receipt('正文'), output='"麦麦"已生成并向当前会话发送了回复"正文"引号"[语音消息][语音消息]"')
+        cleaned = self.v.filter_items([source], 'chat')[0]
+        self.assertEqual(cleaned['output'], '"麦麦"已生成并向当前会话发送了回复"正文"引号""')
+
+    def test_persistent_counts_expiry_and_corrupt_preservation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'calls.json'
+            self.v.path = path
+            self.v.save()
+            loaded = ReplyReceiptVisibility(path, clock=lambda: 1000)
+            loaded.load()
+            self.assertEqual(loaded.calls, self.v.calls)
+            self.assertNotIn('正文', path.read_text(encoding='utf-8'))
+            expired = ReplyReceiptVisibility(path, clock=lambda: 1000 + self.v.TTL + 1)
+            expired.load()
+            self.assertFalse(expired.calls)
+            path.write_text('bad', encoding='utf-8')
+            broken = ReplyReceiptVisibility(path)
+            with self.assertRaises(ValueError): broken.load()
+            broken.save()
+            self.assertEqual(path.read_text(encoding='utf-8'), 'bad')
+
+    def test_invalid_counts_and_scope_are_not_remembered(self):
+        for count in [True, 0, -1, 257, '2']:
+            self.v.remember('chat', 'bad', count, 'text_and_voice')
+        self.assertNotIn(('chat', 'bad'), self.v.calls)
 
 
 class VisibilityTests(TestCase):

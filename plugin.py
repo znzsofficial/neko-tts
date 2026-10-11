@@ -16,10 +16,10 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 try:
     from .audio import SpeechEngine, SpeechError, split_text, voice_message
-    from .history_visibility import VoiceVisibility
+    from .history_visibility import ReplyReceiptVisibility, VoiceVisibility
 except ImportError:
     from audio import SpeechEngine, SpeechError, split_text, voice_message
-    from history_visibility import VoiceVisibility
+    from history_visibility import ReplyReceiptVisibility, VoiceVisibility
 
 
 class PluginSection(PluginConfigBase):
@@ -90,10 +90,16 @@ class NekoTTS(MaiBotPlugin):
         self._ready = False
         self._pending: dict[str, list[tuple[str, float]]] = {}
         self._visibility = VoiceVisibility()
+        self._reply_visibility = ReplyReceiptVisibility()
 
     async def on_load(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
         self._visibility = VoiceVisibility(Path(self.ctx.paths.data_dir) / 'voice-receipts.json')
+        self._reply_visibility = ReplyReceiptVisibility(Path(self.ctx.paths.data_dir) / 'reply-receipts.json')
+        try:
+            self._reply_visibility.load()
+        except ValueError:
+            self.ctx.logger.warning('Neko TTS 回复回执缓存读取失败，已保留原文件')
         try:
             self._visibility.load_with_legacy(Path(self.ctx.paths.runtime_dir) / 'voice-receipts.json')
         except (ValueError, OSError):
@@ -214,6 +220,11 @@ class NekoTTS(MaiBotPlugin):
             scope = str(kwargs.get('session_id') or '').strip()
             for voice in voices.values():
                 self._visibility.remember_audio(scope, base64.b64decode(voice['segments'][0]['binary_data_base64']))
+            self._reply_visibility.remember(scope, kwargs.get('call_id'), len(voices), self.config.output.mode)
+            try:
+                self._reply_visibility.save()
+            except OSError:
+                self.ctx.logger.warning('Neko TTS 回复回执保存失败，当前会话过滤仍有效')
             return {"messages": result}
         except asyncio.CancelledError:
             raise
@@ -294,6 +305,7 @@ class NekoTTS(MaiBotPlugin):
 
     def _visible_prompt(self, items, session_id, kwargs):
         kept = self._visibility.filter_items(items, session_id)
+        kept = self._reply_visibility.filter_items(kept, session_id)
         if kept is items or kept == items:
             return None
         return {'action': 'continue', 'modified_kwargs': dict(kwargs, items=kept, session_id=session_id)}

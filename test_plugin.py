@@ -86,6 +86,21 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertFalse(self.p.ctx.send.custom.call_args.kwargs['sync_to_maisaka_history'])
         self.assertFalse(self.p.ctx.send.custom.call_args.kwargs['storage_message'])
 
+    async def test_reply_tool_receipt_cleaned_in_both_hooks_without_removing_call(self):
+        await self.p.voice_reply_extension(phase='before_send', messages=self.messages,
+                                          session_id='chat-a', call_id='call-tts')
+        call = {'item_type': 'FunctionCallItem', 'tool_call': {'call_id': 'call-tts', 'func_name': 'reply', 'args': {'plugin_options': {'neko.tts.voice': {}}}}}
+        receipt = {'item_type': 'FunctionCallOutputItem', 'call_id': 'call-tts', 'tool_name': 'reply', 'success': True,
+                   'output': '"麦麦"已生成并向"用户"发送了回复"你好[图片][语音消息]"'}
+        user = {'item_type': 'UserMessageItem', 'parts': [{'text': '<message msg_id="user">\n'}, {'text': '[语音消息]'}]}
+        for handler in [self.p.hide_planner_voice, self.p.hide_replyer_voice]:
+            change = await handler(items=[call, receipt, user], session_id='chat-a', item_schema_version=1)
+            items = change['modified_kwargs']['items']
+            self.assertEqual(items[0], call)
+            self.assertEqual(items[2], user)
+            self.assertEqual(items[1]['output'], '"麦麦"已生成并向"用户"发送了回复"你好[图片]"')
+            self.assertEqual(change['modified_kwargs']['item_schema_version'], 1)
+
     async def test_oversized_audio_preserves_original_and_no_receipts(self):
         self.p._render.return_value = b'x' * (8 * 1024 * 1024 + 1)
         self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=self.messages, session_id='chat-a'), {})

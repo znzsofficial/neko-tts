@@ -8,6 +8,7 @@ import re
 import tempfile
 import time
 import math
+from copy import deepcopy
 from collections import OrderedDict
 from pathlib import Path
 
@@ -167,3 +168,115 @@ class VoiceVisibility:
             if not hidden:
                 kept.append(item)
         return kept
+
+
+class ReplyReceiptVisibility:
+    """Remove only the known appended clips from Host reply-tool receipts.
+
+    Call ID + chat + clip count avoid global text replacement: literal mentions
+    of [语音消息] in the original reply remain intact. Never remove tool Items.
+    """
+    TTL = VoiceVisibility.TTL
+    MAX_IDS = VoiceVisibility.MAX_IDS
+    MAX_CACHE_BYTES = VoiceVisibility.MAX_CACHE_BYTES
+
+    def __init__(self, path=None, clock=time.time):
+        self.path = Path(path) if path else None
+        self.clock = clock
+        self.calls = OrderedDict()
+        self.outputs = {}
+        self.healthy_file = True
+
+    def _prune(self):
+        for key, (_, _, expiry) in list(self.calls.items()):
+            if expiry <= self.clock():
+                del self.calls[key]
+        while len(self.calls) > self.MAX_IDS:
+            self.calls.popitem(last=False)
+        for key in list(self.outputs):
+            if key not in self.calls:
+                del self.outputs[key]
+
+    def remember(self, scope, call_id, count, mode):
+        if (not isinstance(scope, str) or not 0 < len(scope) <= 128 or
+                not isinstance(call_id, str) or not 0 < len(call_id) <= 256 or
+                type(count) is not int or not 0 < count <= 256 or
+                mode not in ('text_and_voice', 'voice_only')):
+            return
+        self.calls[(scope, call_id)] = (count, mode, self.clock() + self.TTL)
+        self.calls.move_to_end((scope, call_id))
+        self._prune()
+
+    def load(self):
+        if self.path is None or not self.path.exists():
+            return
+        try:
+            if self.path.stat().st_size > self.MAX_CACHE_BYTES:
+                raise ValueError('receipt cache too large')
+            rows = json.loads(self.path.read_text(encoding='utf-8'))
+            if not isinstance(rows, list) or len(rows) > self.MAX_IDS:
+                raise ValueError('invalid receipt cache')
+            for row in rows:
+                if not isinstance(row, list) or len(row) != 5:
+                    raise ValueError('invalid receipt row')
+                scope, call_id, count, mode, expiry = row
+                if (type(expiry) not in (int, float) or not math.isfinite(expiry) or
+                        expiry > self.clock() + self.TTL + 3600):
+                    raise ValueError('invalid expiry')
+                self.remember(scope, call_id, count, mode)
+                if (scope, call_id) not in self.calls:
+                    raise ValueError('invalid receipt row')
+                self.calls[(scope, call_id)] = (count, mode, expiry)
+            self._prune()
+        except (OSError, ValueError, UnicodeError, OverflowError, RecursionError, TypeError):
+            self.calls.clear()
+            self.healthy_file = False
+            raise ValueError('回复回执缓存无法读取，已保留原文件') from None
+
+    def save(self):
+        if self.path is None or not self.healthy_file:
+            return
+        self._prune()
+        rows = [[scope, call_id, *value] for (scope, call_id), value in self.calls.items()]
+        encoded = json.dumps(rows, ensure_ascii=False)
+        while len(encoded.encode('utf-8')) > self.MAX_CACHE_BYTES and rows:
+            self.calls.popitem(last=False)
+            rows.pop(0)
+            encoded = json.dumps(rows, ensure_ascii=False)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix='.reply-receipts-', dir=self.path.parent)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                os.chmod(name, 0o600)
+                stream.write(encoded)
+            os.replace(name, self.path)
+        finally:
+            if os.path.exists(name):
+                os.unlink(name)
+
+    def filter_items(self, items, scope):
+        if not isinstance(items, list) or not scope:
+            return items
+        self._prune()
+        result = []
+        for item in items:
+            entry = self.calls.get((scope, item.get('call_id'))) if isinstance(item, dict) else None
+            if (entry and item.get('item_type') == 'FunctionCallOutputItem' and
+                    item.get('tool_name') == 'reply' and item.get('success') is True):
+                count, mode, _ = entry
+                output = item.get('output')
+                # Exact current Host success receipt, including its final quote.
+                match = re.fullmatch(r'("[^"\n]+"已生成并向(?:当前会话|"[^"\n]+")发送了回复")(.*)(")',
+                                     output, re.DOTALL) if isinstance(output, str) else None
+                suffix = '[语音消息]' * count
+                key = (scope, item.get('call_id'))
+                digest = hashlib.sha256(output.encode('utf-8')).hexdigest() if isinstance(output, str) else None
+                original_digest = self.outputs.get(key)
+                if match and match[2].endswith(suffix) and (original_digest is None or original_digest == digest):
+                    body = match[2][:-len(suffix)]
+                    if mode == 'text_and_voice' or not body:
+                        self.outputs[key] = digest
+                        item = deepcopy(item)
+                        item['output'] = match[1] + body + match[3] if mode == 'text_and_voice' else '回复已发送。'
+            result.append(item)
+        return result
