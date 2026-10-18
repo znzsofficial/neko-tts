@@ -148,9 +148,7 @@ class NekoTTS(MaiBotPlugin):
 
     @ReplyExtension(
         "voice",
-        description=("用户要求语音回复，或你想用语音表达时，主动选择此扩展（参数填 {}）。"
-                      "主动选择不受随机概率限制；不要只在正文说会发语音。"
-                      "使用固定音色和语气提示；参数仅本次生效。"),
+        description="要用语音回复就选择此扩展，参数填{}；主动选择不受随机概率限制。",
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         priority=20, timeout_ms=240000,
     )
