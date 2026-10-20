@@ -6,7 +6,7 @@
 
 ## 安装
 
-需要 MaiBot **1.3.5+**、SDK **2.10.0+**、Python 3.12+、aiohttp 3.12+。音色克隆及多段音频合并需要 FFmpeg（PATH 或配置指定）。
+0.7.0需要 MaiBot **1.3.11+并具备下述精确回执本地补丁**、SDK **2.10.0+**、Python 3.12+、aiohttp 3.12+。宿主注册组件时会校验Hook是否存在，因此即使暂用同步模式，未修改的上游宿主也不能直接安装0.7.0；无补丁请保留0.6.5，不绕过Hook校验。音色克隆及多段音频合并需要 FFmpeg（PATH 或配置指定）。
 
 ```sh
 git clone https://github.com/znzsofficial/neko-tts.git plugins/neko-tts
