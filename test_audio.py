@@ -3,7 +3,7 @@ import io
 import tempfile
 import wave
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
 from audio import SpeechEngine, SpeechError
@@ -106,6 +106,21 @@ class TransportTests(IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(SpeechError, '^MiMo HTTP 429$'):
                 await self.engine.render(['你好'], self.config)
         self.assertEqual(len(self.calls), 3)
+
+    async def test_ambiguous_provider_timeout_is_not_retried(self):
+        # The request may have reached the provider: a lost response is not a
+        # transient HTTP rejection and must not trigger another paid request.
+        session = Mock()
+        session.post.side_effect = TimeoutError('response acknowledgement lost')
+        self.engine.session = session
+        try:
+            with patch('audio.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                with self.assertRaises(TimeoutError):
+                    await self.engine.render(['你好'], self.config)
+                sleep.assert_not_awaited()
+            session.post.assert_called_once()
+        finally:
+            self.engine.session = None
 
     async def test_empty_success_recovers_without_changing_text(self):
         self.empty_once = True

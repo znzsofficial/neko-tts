@@ -292,6 +292,29 @@ class PluginTests(IsolatedAsyncioTestCase):
         result = await self.p.command(stream_id='a', user_id='owner', matched_groups={'text': '你好'})
         self.assertFalse(result[0])
 
+    async def test_unknown_command_delivery_never_resends(self):
+        self.p.config.command.allowed_user_ids = ['owner']
+        self.p.ctx.send.custom.side_effect = TimeoutError('delivery acknowledgement lost')
+        result = await self.p.command(stream_id='chat-a', user_id='owner', matched_groups={'text': '你好'})
+        self.assertFalse(result[0])
+        self.p._render.assert_awaited_once_with('你好')
+        self.p.ctx.send.custom.assert_awaited_once()
+
+    async def test_unknown_background_delivery_consumes_pending_once(self):
+        self.p.config.output.mode = 'text_then_voice'
+        self.p.ctx.send.custom.side_effect = TimeoutError('delivery acknowledgement lost')
+        await self.p.voice_reply_extension(phase='before_send', messages=self.messages, session_id='chat-a')
+        message = {'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': '你好'}]}
+        await self.p.after_text_send(message=message, sent=True)
+        tasks = tuple(self.p._tasks)
+        self.assertEqual(len(tasks), 1)
+        await asyncio.gather(*tasks)
+        await self.p.after_text_send(message=message, sent=True)
+        await asyncio.sleep(0)
+        self.p._render.assert_awaited_once_with('你好')
+        self.p.ctx.send.custom.assert_awaited_once()
+        self.assertNotIn('chat-a', self.p._pending)
+
     async def test_reset_cancels_pending_work(self):
         self.p._engine = SimpleNamespace(close=AsyncMock())
         task = asyncio.create_task(asyncio.sleep(100))

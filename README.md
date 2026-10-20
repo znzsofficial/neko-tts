@@ -84,10 +84,27 @@ MiMo 返回 429/502/503/504 时最多退避重试两次；第一次请求 `finis
 ## 开发与验收
 
 ```sh
-uv run --no-project --with maibot-plugin-sdk==2.10.0 --with aiohttp python -m unittest -q
+python -m pip install 'maibot-plugin-sdk==2.10.0' 'aiohttp>=3.12' imageio-ffmpeg tzdata
+python scripts/check.py
+python scripts/package.py
+# 可选：输出到尚不存在的路径，不创建 GitHub Release
+python scripts/package.py --output neko-tts.zip
 ```
 
 测试覆盖真实 SDK 导入、混合触发/主动优先/避免重复/其他工具不变、回复扩展失败回退、命令鉴权、分段保真、固定提示原样发送、模拟 MiMo HTTP、限流退避、缺失音频恢复和重试上限，以及实际 FFmpeg 参考选取和合并。无系统 FFmpeg 时可在测试命令加 `--with imageio-ffmpeg`。
+
+GitHub Actions 在 Ubuntu/Windows × Python 3.12/3.14 × SDK `==2.10.0`/`==2.12.0`/`>=2.12,<3` 共12档运行，
+额外保留manifest声明的2.10最低支持档。PyPI包名`maibot-plugin-sdk`，导入名`maibot_sdk`。
+门禁要求至少70项、0 skip、0失败；缺真实SDK、缺FFmpeg导致关键测试跳过均失败。
+CI显式装`imageio-ffmpeg`作为真实FFmpeg备用（测试优先系统PATH，否则使用其二进制）、`tzdata`统一Windows时区依赖。
+FFmpeg测试仅使用临时目录生成的合成音频，不扫描真实参考音频目录；HTTP测试仅本机假服务/Mock，不调用MiMo、付费模型或QQ。
+新增未知结果回归确认供应商响应超时不重新请求、命令投递超时不重发、后台已消耗匹配记录不因重复回执重发。
+不改变逐宿主消息合成、Planner主动选择、用户语音可见、命令权限、固定提示或概率。
+
+源码ZIP只读取`scripts/package.py`列出的8个文件：源码、manifest、许可证、README/CHANGELOG和公开示例配置。
+不递归扫描，拒绝符号链接；实际`config.toml`、`.env`、Key、音频、语音/回复回执、缓存及运行数据均不打包。
+包边界回归检查私密哨兵和多余成员；CI临时解压并用真实SDK导入、构造插件，不调用`on_load`，不加载宿主服务。
+默认产物随临时目录清理，不上传artifact、不创建Release、不部署；仅显式`--output`保留本地ZIP。
 
 2026-10-07 已用线上配置复现缺少 audio 和 HTTP 429，并在修复后对原失败文本完成真实合成；用户反馈暂时正常。接口合成测试与 QQ 最终投递是两项不同的验证。
 
