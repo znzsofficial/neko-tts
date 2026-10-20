@@ -185,12 +185,12 @@ class PluginTests(IsolatedAsyncioTestCase):
     async def test_background_matches_each_host_message_without_rejoining(self):
         self.p.config.output.mode = 'text_then_voice'
         messages = [self.messages[0], {'segments': [{'type': 'text', 'data': '第二句'}], 'quote_previous': False}]
-        await self.p.voice_reply_extension(phase='before_send', messages=messages, session_id='chat-a')
-        self.assertEqual([item[0] for item in self.p._pending['chat-a']], ['你好', '第二句'])
-        self.p._background_voice = AsyncMock()
-        for text in ['你好', '第二句']:
-            await self.p.after_text_send(message={'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': text}]}, sent=True)
-        await asyncio.sleep(0)
+        await self.p.voice_reply_extension(phase='before_send', messages=messages, session_id='chat-a', reply_id='r', call_id='c')
+        self.p._background_voice = AsyncMock(return_value=True)
+        await self.p.after_reply_delivery(session_id='chat-a', reply_id='r', call_id='c', send_results=[
+            {'index': 0, 'success': True, 'message_id': '1', 'text': '你好'},
+            {'index': 1, 'success': True, 'message_id': '2', 'text': '第二句'}])
+        await asyncio.gather(*list(self.p._tasks))
         self.assertEqual([call.args for call in self.p._background_voice.await_args_list], [('你好', 'chat-a'), ('第二句', 'chat-a')])
 
     async def test_attachment_only_is_unchanged(self):
@@ -200,34 +200,40 @@ class PluginTests(IsolatedAsyncioTestCase):
     async def test_text_then_voice_registers_without_synthesizing(self):
         self.p.config.output.mode = 'text_then_voice'
         result = await self.p.voice_reply_extension(phase='before_send',
-                                                    session_id='chat-a', messages=self.messages,
-                                                     parameters={})
+                                                     session_id='chat-a', messages=self.messages,
+                                                      parameters={}, reply_id='r', call_id='c')
         self.assertEqual(result['messages'], self.messages)
         self.p._render.assert_not_called()
-        self.assertEqual(self.p._pending['chat-a'][0][0], '你好')
+        self.assertEqual(self.p._deferred.pending[('chat-a', 'r')]['indices'], {0})
 
     async def test_text_then_voice_starts_only_after_matching_send(self):
         self.p.config.output.mode = 'text_then_voice'
-        self.p._pending['chat-a'] = [('你好', 9999999999)]
-        self.p._background_voice = AsyncMock()
+        self.p._deferred.register('chat-a', 'r', 'c', [(0, '你好')])
+        self.p._background_voice = AsyncMock(return_value=True)
         await self.p.after_text_send(
             message={'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': '你好'}]},
             sent=True,
         )
         await asyncio.sleep(0)
+        self.p._background_voice.assert_not_awaited()
+        await self.p.after_reply_delivery(session_id='chat-a', reply_id='r', call_id='c', send_results=[
+            {'index': 0, 'success': True, 'message_id': '1', 'text': '你好'}])
+        await asyncio.gather(*list(self.p._tasks))
         self.p._background_voice.assert_awaited_once_with('你好', 'chat-a')
-        self.assertNotIn('chat-a', self.p._pending)
+        self.assertFalse(self.p._deferred.pending)
 
     async def test_background_registration_requires_chat(self):
         self.p.config.output.mode = 'text_then_voice'
         self.assertEqual(await self.p.voice_reply_extension(phase='before_send', messages=self.messages), {})
-        self.assertEqual(self.p._pending, {})
+        self.assertEqual(self.p._deferred.pending, {})
 
     async def test_expired_background_records_are_removed(self):
         self.p.config.output.mode = 'text_then_voice'
-        self.p._pending['chat-a'] = [('你好', 0)]
-        await self.p.after_text_send(message={'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': '你好'}]}, sent=True)
-        self.assertNotIn('chat-a', self.p._pending)
+        self.p._deferred.register('chat-a', 'r', 'c', [(0, '你好')])
+        self.p._deferred.pending[('chat-a', 'r')]['expires'] = 0
+        await self.p.after_reply_delivery(session_id='chat-a', reply_id='r', call_id='c', send_results=[
+            {'index': 0, 'success': True, 'message_id': '1', 'text': '你好'}])
+        self.assertFalse(self.p._deferred.pending)
         self.p._render.assert_not_called()
 
     async def test_failure_preserves_original(self):
@@ -303,17 +309,18 @@ class PluginTests(IsolatedAsyncioTestCase):
     async def test_unknown_background_delivery_consumes_pending_once(self):
         self.p.config.output.mode = 'text_then_voice'
         self.p.ctx.send.custom.side_effect = TimeoutError('delivery acknowledgement lost')
-        await self.p.voice_reply_extension(phase='before_send', messages=self.messages, session_id='chat-a')
-        message = {'session_id': 'chat-a', 'raw_message': [{'type': 'text', 'data': '你好'}]}
-        await self.p.after_text_send(message=message, sent=True)
+        await self.p.voice_reply_extension(phase='before_send', messages=self.messages, session_id='chat-a', reply_id='r', call_id='c')
+        receipt = dict(session_id='chat-a', reply_id='r', call_id='c', send_results=[
+            {'index': 0, 'success': True, 'message_id': '1', 'text': '你好'}])
+        await self.p.after_reply_delivery(**receipt)
         tasks = tuple(self.p._tasks)
         self.assertEqual(len(tasks), 1)
         await asyncio.gather(*tasks)
-        await self.p.after_text_send(message=message, sent=True)
+        await self.p.after_reply_delivery(**receipt)
         await asyncio.sleep(0)
         self.p._render.assert_awaited_once_with('你好')
         self.p.ctx.send.custom.assert_awaited_once()
-        self.assertNotIn('chat-a', self.p._pending)
+        self.assertFalse(self.p._deferred.pending)
 
     async def test_reset_cancels_pending_work(self):
         self.p._engine = SimpleNamespace(close=AsyncMock())

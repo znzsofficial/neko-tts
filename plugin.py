@@ -17,9 +17,11 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 try:
     from .audio import SpeechEngine, SpeechError, split_text, voice_message
     from .history_visibility import ReplyReceiptVisibility, VoiceVisibility
+    from .deferred_speech import DeferredSpeech
 except ImportError:
     from audio import SpeechEngine, SpeechError, split_text, voice_message
     from history_visibility import ReplyReceiptVisibility, VoiceVisibility
+    from deferred_speech import DeferredSpeech
 
 
 class PluginSection(PluginConfigBase):
@@ -88,7 +90,9 @@ class NekoTTS(MaiBotPlugin):
         self._tasks = set()
         self._generation = 0
         self._ready = False
-        self._pending: dict[str, list[tuple[str, float]]] = {}
+        self._deferred = DeferredSpeech()
+        self._voice_queue = asyncio.Queue(maxsize=8)
+        self._voice_worker = None
         self._visibility = VoiceVisibility()
         self._reply_visibility = ReplyReceiptVisibility()
 
@@ -117,7 +121,9 @@ class NekoTTS(MaiBotPlugin):
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._engine:
             await self._engine.close()
-        self._pending.clear()
+        self._deferred = DeferredSpeech()
+        self._voice_queue = asyncio.Queue(maxsize=8)
+        self._voice_worker = None
         self._visibility.pending.clear()
 
     async def on_unload(self):
@@ -182,10 +188,8 @@ class NekoTTS(MaiBotPlugin):
                 stream_id = str(kwargs.get("session_id") or "").strip()
                 if not stream_id:
                     raise ValueError("无法获取当前聊天")
-                now = time.monotonic()
-                pending = [item for item in self._pending.get(stream_id, []) if item[1] > now]
-                pending.extend((spoken, now + 180) for _, spoken in speech)
-                self._pending[stream_id] = pending
+                if not self._deferred.register(stream_id, kwargs.get('reply_id'), kwargs.get('call_id'), speech):
+                    raise ValueError('缺少精确回复标识、重复登记或后台语音待确认队列已满')
                 return {"messages": deepcopy(messages)}
 
             generation = self._generation
@@ -262,9 +266,9 @@ class NekoTTS(MaiBotPlugin):
         return {"action": "continue", "modified_kwargs": dict(kwargs, output_items=items, session_id=session_id)}
 
     @HookHandler("send_service.after_send", name="neko_tts_after_send", mode=HookMode.BLOCKING,
-                 order=HookOrder.LATE, timeout_ms=300000, error_policy=ErrorPolicy.SKIP)
+                  order=HookOrder.LATE, timeout_ms=5000, error_policy=ErrorPolicy.SKIP)
     async def after_text_send(self, message=None, sent=False, **kwargs):
-        """For text_then_voice, queue the exact delivered reply for background speech."""
+        """Observe voice visibility only; never match unrelated outgoing text."""
         if not sent or not self._ready or not self.config.plugin.enabled:
             return None
         stream_id = str(kwargs.get("stream_id") or (message or {}).get("session_id") or "").strip()
@@ -273,33 +277,57 @@ class NekoTTS(MaiBotPlugin):
                 self._visibility.save()
             except OSError:
                 self.ctx.logger.warning('Neko TTS 语音回执保存失败，当前会话过滤仍有效')
-        if self.config.output.mode != "text_then_voice":
-            return None
-        text = "".join(
-            str(item.get("data") or "")
-            for item in (message or {}).get("raw_message", [])
-            if isinstance(item, dict) and item.get("type") == "text"
-        ).strip()
-        if not stream_id or not text:
-            return None
-        pending = self._pending.get(stream_id, [])
-        now = time.monotonic()
-        match = next(((i, item) for i, item in enumerate(pending) if item[1] > now and item[0] == text), None)
-        if match is None:
-            remaining = [item for item in pending if item[1] > now]
-            if remaining:
-                self._pending[stream_id] = remaining
-            else:
-                self._pending.pop(stream_id, None)
-            return None
-        index, _ = match
-        pending.pop(index)
-        if not pending:
-            self._pending.pop(stream_id, None)
-        task = asyncio.create_task(self._background_voice(text, stream_id))
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
         return None
+
+    @HookHandler('maisaka.reply.after_send', name='neko_tts_reply_delivery',
+                 mode=HookMode.BLOCKING, order=HookOrder.LATE, timeout_ms=5000,
+                 error_policy=ErrorPolicy.SKIP)
+    async def after_reply_delivery(self, session_id='', reply_id='', call_id='', send_results=None, **kwargs):
+        if not self._ready or not self.config.plugin.enabled or self.config.output.mode != 'text_then_voice':
+            return None
+        if not all(isinstance(value, str) for value in [session_id, reply_id, call_id]):
+            return None
+        speech = self._deferred.claim(session_id, reply_id, call_id, send_results)
+        if not speech:
+            return None
+        config = self.config.general.model_dump()
+        try:
+            chunks = [chunk for _, text in speech for chunk in split_text(text, config)]
+            if sum(map(len, chunks)) > config['max_total_length'] or len(chunks) > config['max_segments']:
+                raise ValueError('最终发送正文超过整条回复语音限制')
+            self._voice_queue.put_nowait((session_id, speech, time.monotonic() + config['timeout'], self._generation))
+        except (ValueError, asyncio.QueueFull):
+            self.ctx.logger.warning('Neko TTS 后台队列已满或正文超限，文字已保留，不重试')
+            return None
+        if self._voice_worker is None or self._voice_worker.done():
+            self._voice_worker = asyncio.create_task(self._drain_voice_queue())
+            self._tasks.add(self._voice_worker)
+            self._voice_worker.add_done_callback(self._tasks.discard)
+        return None
+
+    async def _drain_voice_queue(self):
+        try:
+            while True:
+                try:
+                    stream, speech, deadline, generation = self._voice_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or generation != self._generation:
+                        continue
+                    async with asyncio.timeout(remaining):
+                        for _, text in speech:
+                            if generation != self._generation or not self._ready or not self.config.plugin.enabled:
+                                break
+                            if not await self._background_voice(text, stream):
+                                break
+                except TimeoutError:
+                    self.ctx.logger.warning('Neko TTS 后台整条回复已超时（含排队），文字已保留，不重试')
+                finally:
+                    self._voice_queue.task_done()
+        finally:
+            self._voice_worker = None
 
     def _visible_prompt(self, items, session_id, kwargs):
         kept = self._visibility.filter_items(items, session_id)
@@ -318,9 +346,12 @@ class NekoTTS(MaiBotPlugin):
     async def hide_replyer_voice(self, items=None, session_id='', **kwargs):
         return self._visible_prompt(items, session_id, kwargs)
 
-    async def _background_voice(self, text: str, stream_id: str) -> None:
+    async def _background_voice(self, text: str, stream_id: str) -> bool:
+        generation = self._generation
         try:
             audio = await self._render(text)
+            if generation != self._generation or not self._ready or not self.config.plugin.enabled:
+                return False
             if len(audio) > 8 * 1024 * 1024:
                 raise ValueError('语音超过安全传输大小')
             self._visibility.remember_audio(stream_id, audio)
@@ -331,10 +362,12 @@ class NekoTTS(MaiBotPlugin):
             )
             if not sent:
                 self.ctx.logger.warning("Neko TTS 后台语音发送失败：平台未确认成功")
+            return bool(sent)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             self.ctx.logger.warning("Neko TTS 后台补发失败，文字已保留：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
+            return False
 
     @Command("neko_tts_cmd", description="测试语音：/neko-tts <文本>；/neko-tts status 查看模式",
              pattern=r"^/neko-tts(?:\s+(?P<text>[\s\S]+))?$")
