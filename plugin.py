@@ -239,7 +239,7 @@ class NekoTTS(MaiBotPlugin):
     async def hybrid_reply(self, output_items=None, session_id="", **kwargs):
         """Opt random replies into the same extension; never run a second TTS path."""
         if (not self._ready or not self.config.plugin.enabled or self.config.trigger.mode != "hybrid"
-                or not session_id or not isinstance(output_items, list)):
+                or not isinstance(output_items, list)):
             return None
         items = deepcopy(output_items)
         changed = False
@@ -251,6 +251,11 @@ class NekoTTS(MaiBotPlugin):
                 continue
             args = call.get('args')
             if not isinstance(args, dict):
+                continue
+            # 1.3.12 shared Focus has no default chat; each routed reply declares
+            # its target. Host router still validates group membership/permissions.
+            target = session_id or args.get('session_id')
+            if not isinstance(target, str) or not target.strip():
                 continue
             options = args.get('plugin_options', {})
             if not isinstance(options, dict) or 'neko.tts.voice' in options:

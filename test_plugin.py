@@ -275,6 +275,27 @@ class PluginTests(IsolatedAsyncioTestCase):
         result = await self.p.voice_reply_extension(phase='before_send', messages=self.messages)
         self.assertEqual(result['messages'][-1]['segments'][0]['type'], 'voice')
 
+    async def test_shared_focus_routes_random_choice_per_reply_without_default_chat(self):
+        self.p.config.trigger.mode = 'hybrid'
+        items = [self.reply_item({'session_id': 'chat-a', 'msg_id': 'a'}),
+                 self.reply_item({'session_id': 'chat-b', 'msg_id': 'b'})]
+        with patch('plugin.random.random', side_effect=[0.01, 0.99]) as roll:
+            result = await self.p.hybrid_reply(output_items=items, session_id='')
+        calls = result['modified_kwargs']['output_items']
+        self.assertIn('neko.tts.voice', calls[0]['tool_call']['args']['plugin_options'])
+        self.assertNotIn('plugin_options', calls[1]['tool_call']['args'])
+        self.assertEqual(calls[0]['tool_call']['args']['session_id'], 'chat-a')
+        self.assertEqual(result['modified_kwargs']['session_id'], '')
+        self.assertEqual(roll.call_count, 2)
+        self.p._render.assert_not_awaited()
+
+    async def test_shared_focus_explicit_selection_bypasses_roll_and_invalid_route_is_skipped(self):
+        self.p.config.trigger.mode = 'hybrid'
+        items = [self.reply_item({'session_id': 'chat', 'plugin_options': {'neko.tts.voice': {}}}),
+                 self.reply_item({'session_id': 123}), self.reply_item({'session_id': ''})]
+        with patch('plugin.random.random', side_effect=AssertionError('must not roll')):
+            self.assertIsNone(await self.p.hybrid_reply(output_items=items, session_id=''))
+
     async def test_hybrid_miss_and_planner_disabled_do_not_inject(self):
         with patch('plugin.random.random', return_value=0.9):
             self.assertIsNone(await self.p.hybrid_reply(output_items=[self.reply_item()], session_id='chat'))
