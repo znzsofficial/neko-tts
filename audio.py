@@ -27,11 +27,18 @@ def decode_response(raw):
         raise SpeechError('MiMo missing_choices')
     choice = choices[0]
     reason = choice.get('finish_reason')
-    reason = reason if reason in {'stop', 'length', 'content_filter', 'error'} else 'unknown'
     if reason == 'content_filter':
         raise SpeechError('MiMo content_filter')
     if reason == 'length':
         raise SpeechError('MiMo truncated_audio')
+    if reason == 'error':
+        raise SpeechError('MiMo synthesis_error')
+    # Older successful responses omit this optional field (or use null).
+    # Accept only that legacy shape or explicit stop; new explicit reasons
+    # must be reviewed, never promoted to success by residual audio alone.
+    if reason is not None and reason != 'stop':
+        raise SpeechError('MiMo unknown_finish_reason')
+    reason = 'stop' if reason == 'stop' else 'unknown'
     message = choice.get('message')
     audio = message.get('audio') if isinstance(message, dict) else None
     data = audio.get('data') if isinstance(audio, dict) else None

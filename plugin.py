@@ -151,6 +151,14 @@ class NekoTTS(MaiBotPlugin):
             if generation != self._generation:
                 raise ValueError("配置已更新，请重新调用")
             return result
+        except asyncio.CancelledError:
+            # _reset cancels child renders, not synchronous RPC callers. Only
+            # translate that internal generation change into normal fallback.
+            # Caller cancellation (including a reply deadline) always wins,
+            # even if reset raced it; unrelated child cancellation propagates.
+            if generation != self._generation and not asyncio.current_task().cancelling():
+                raise ValueError('语音合成因配置换代取消') from None
+            raise
         finally:
             self._tasks.discard(task)
 
@@ -402,16 +410,22 @@ class NekoTTS(MaiBotPlugin):
             audio = await self._render(text)
             if len(audio) > 8 * 1024 * 1024:
                 raise ValueError('语音超过安全传输大小')
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.warning("Neko TTS 测试合成失败：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
+            return False, "语音合成失败，请检查配置和服务状态。", True
+        try:
             self._visibility.remember_audio(stream_id, audio)
             sent = await self.ctx.send.custom('voice', base64.b64encode(audio).decode('ascii'), stream_id,
                                              processed_plain_text='', storage_message=False, sync_to_maisaka_history=False,
                                              maisaka_source_kind='tool_voice')
-            return bool(sent), "语音已发送" if sent else "语音发送失败", True
+            return bool(sent), "语音已发送" if sent else "语音已合成，但平台未确认发送成功；不会自动重发。", True
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.ctx.logger.warning("Neko TTS 测试失败：%s", str(exc) if isinstance(exc, SpeechError) else type(exc).__name__)
-            return False, "语音合成失败，请检查配置和服务状态。", True
+            self.ctx.logger.warning("Neko TTS 测试投递结果未知，不重发：%s", type(exc).__name__)
+            return False, "语音已合成，但发送结果未知，可能已送达；请先确认，勿立即重试。不会自动重发。", True
 
 
 def create_plugin():

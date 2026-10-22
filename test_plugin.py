@@ -337,12 +337,19 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.p.ctx.send.custom.return_value = False
         result = await self.p.command(stream_id='a', user_id='owner', matched_groups={'text': '你好'})
         self.assertFalse(result[0])
+        self.assertIn('已合成', result[1])
+        self.assertIn('未确认', result[1])
+        self.assertNotIn('合成失败', result[1])
 
     async def test_unknown_command_delivery_never_resends(self):
         self.p.config.command.allowed_user_ids = ['owner']
         self.p.ctx.send.custom.side_effect = TimeoutError('delivery acknowledgement lost')
         result = await self.p.command(stream_id='chat-a', user_id='owner', matched_groups={'text': '你好'})
         self.assertFalse(result[0])
+        self.assertIn('发送结果未知', result[1])
+        self.assertIn('勿立即重试', result[1])
+        self.assertIn('不会自动重发', result[1])
+        self.assertNotIn('合成失败', result[1])
         self.p._render.assert_awaited_once_with('你好')
         self.p.ctx.send.custom.assert_awaited_once()
 

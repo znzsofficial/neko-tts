@@ -1,13 +1,57 @@
 import base64
 import io
+import json
+import math
+import struct
 import tempfile
 import wave
-from unittest import IsolatedAsyncioTestCase
+from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
-from audio import SpeechEngine, SpeechError
+from audio import SpeechEngine, SpeechError, decode_response
 from plugin import Config
+
+
+def pcm_wav():
+    """Real, generated mono PCM WAV: no private samples or codec dependency."""
+    stream = io.BytesIO()
+    with wave.open(stream, 'wb') as file:
+        file.setnchannels(1)
+        file.setsampwidth(2)
+        file.setframerate(24000)
+        file.writeframes(b''.join(struct.pack('<h', int(4000 * math.sin(i * math.tau * 440 / 24000)))
+                                  for i in range(2400)))
+    return stream.getvalue()
+
+
+def audio_response(reason='stop'):
+    return json.dumps({'choices': [{'finish_reason': reason, 'message': {'audio': {
+        'data': base64.b64encode(pcm_wav()).decode('ascii')}}}]}).encode()
+
+
+class DecodeTests(TestCase):
+    def test_success_and_legacy_missing_reason_accept_real_pcm_wav(self):
+        for reason in ('stop', None):
+            with self.subTest(reason=reason):
+                audio = decode_response(audio_response(reason))
+                with wave.open(io.BytesIO(audio), 'rb') as file:
+                    self.assertEqual((file.getnchannels(), file.getsampwidth(), file.getframerate(), file.getnframes()),
+                                     (1, 2, 24000, 2400))
+        payload = json.loads(audio_response())
+        del payload['choices'][0]['finish_reason']
+        self.assertEqual(decode_response(json.dumps(payload)), pcm_wav())
+
+    def test_failure_reasons_reject_even_valid_residual_pcm(self):
+        for reason, expected in [('error', 'synthesis_error'), ('length', 'truncated_audio'),
+                                 ('content_filter', 'content_filter')]:
+            with self.subTest(reason=reason), self.assertRaisesRegex(SpeechError, '^MiMo ' + expected + '$'):
+                decode_response(audio_response(reason))
+
+    def test_unknown_explicit_reasons_fail_closed_without_leaking_content(self):
+        for reason in ('private provider diagnostic', '', 'tool_calls', [], {}, 0, False):
+            with self.subTest(reason=reason), self.assertRaisesRegex(SpeechError, '^MiMo unknown_finish_reason$'):
+                decode_response(audio_response(reason))
 
 
 class TransportTests(IsolatedAsyncioTestCase):
@@ -128,6 +172,17 @@ class TransportTests(IsolatedAsyncioTestCase):
             self.assertEqual(await self.engine.render(['你好'], self.config), self.audio)
         self.assertEqual(len(self.calls), 2)
         self.assertEqual(self.calls[0], self.calls[1])
+
+    async def test_residual_audio_error_and_unknown_reason_are_not_retried(self):
+        for reason in ('error', 'length', 'content_filter', 'future_reason'):
+            with self.subTest(reason=reason):
+                self.calls.clear()
+                self.payload = json.loads(audio_response(reason))
+                with patch('audio.asyncio.sleep', new_callable=AsyncMock) as sleep:
+                    with self.assertRaises(SpeechError):
+                        await self.engine.render(['你好'], self.config)
+                self.assertEqual(len(self.calls), 1)
+                sleep.assert_not_awaited()
 
     async def test_missing_audio_is_bounded_and_filter_is_not_retried(self):
         for reason, expected in [('stop', 'missing_audio'), ('content_filter', 'content_filter')]:
