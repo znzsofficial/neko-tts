@@ -11,7 +11,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parents[1]
 FILES = (
     "_manifest.json", "plugin.py", "audio.py", "history_visibility.py", "deferred_speech.py",
-    "README.md", "CHANGELOG.md", "LICENSE", "config.example.toml",
+    "README.md", "CHANGELOG.md", "LICENSE", "config.example.toml", "focus_scope.py",
 )
 
 

@@ -10,5 +10,5 @@ sys.path.insert(0, str(ROOT))
 print("maibot-plugin-sdk", importlib.metadata.version("maibot-plugin-sdk"), flush=True)
 suite = unittest.defaultTestLoader.discover(str(ROOT), pattern="test_*.py")
 result = unittest.TextTestRunner(verbosity=2).run(suite)
-if result.testsRun < 92 or result.skipped or not result.wasSuccessful():
-    raise SystemExit("CI gate failed: fewer than 92 tests, skipped tests, or failures")
+if result.testsRun < 98 or result.skipped or not result.wasSuccessful():
+    raise SystemExit("CI gate failed: fewer than 98 tests, skipped tests, or failures")

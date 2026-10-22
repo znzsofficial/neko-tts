@@ -134,7 +134,7 @@ class VoiceVisibility:
             if os.path.exists(name):
                 os.unlink(name)
 
-    def filter_items(self, items, scope):
+    def filter_items(self, items, scope, *, shared=False):
         if not isinstance(items, list) or not scope:
             return items
         self._prune()
@@ -146,7 +146,7 @@ class VoiceVisibility:
         kept = []
         for item in items:
             hidden = False
-            if isinstance(item, dict) and item.get('item_type') == 'AssistantMessageItem':
+            if not shared and isinstance(item, dict) and item.get('item_type') == 'AssistantMessageItem':
                 # Replyer rebuilds guided bot history as Assistant Items and
                 # drops platform IDs/prefixes. Only its empty voice placeholder
                 # can safely be recognized here; never strip mixed text.
@@ -160,17 +160,26 @@ class VoiceVisibility:
                 text = first.get('text') if isinstance(first, dict) else None
                 # Only the Host-generated first message prefix. Do not scan
                 # quoted text, tool results, user bodies or attachment captions.
-                prefix = re.match(r'^<message\s+([^>]+)>\n', text) if isinstance(text, str) else None
+                prefix = ((re.fullmatch if shared else re.match)(r'<message\s+([^>]+)>\n', text)
+                          if isinstance(text, str) else None)
                 if prefix:
                     attrs = dict(re.findall(r'([a-z_]+)="([^"]*)"', prefix.group(1)))
                     message_id = html.unescape(attrs.get('msg_id', ''))
-                    chat = html.unescape(attrs.get('chat_id', '')) or scope
+                    session = html.unescape(attrs.get('session_id', ''))
+                    legacy_chat = html.unescape(attrs.get('chat_id', ''))
+                    if session and legacy_chat and session != legacy_chat:
+                        kept.append(item)
+                        continue
+                    chat = session or legacy_chat or ('' if shared else scope)
+                    if shared and chat != scope:
+                        kept.append(item)
+                        continue
                     hidden = (chat, message_id) in self.ids
                     if not hidden and attrs.get('is_self_message') == 'true':
                         hidden = (chat, message_id) in aliases
                         # Historical self-voice placeholders contain no speech
                         # text to remember. Do not match arbitrary user bodies.
-                        if not hidden and len(parts) == 2:
+                        if not hidden and not shared and len(parts) == 2:
                             body = parts[1].get('text') if isinstance(parts[1], dict) else None
                             hidden = body == '[语音消息]'
             if not hidden:
@@ -262,14 +271,24 @@ class ReplyReceiptVisibility:
             if os.path.exists(name):
                 os.unlink(name)
 
-    def filter_items(self, items, scope):
+    def filter_items(self, items, scope, *, shared=False):
         if not isinstance(items, list) or not scope:
             return items
         self._prune()
+        scoped_calls = set()
+        if shared:
+            owners = {}
+            for value in items:
+                call = value.get('tool_call') if isinstance(value, dict) and value.get('item_type') == 'FunctionCallItem' else None
+                args = call.get('args') if isinstance(call, dict) else None
+                if (isinstance(args, dict) and call.get('func_name') == 'reply'
+                        and isinstance(call.get('call_id'), str) and isinstance(args.get('session_id'), str)):
+                    owners.setdefault(call['call_id'], set()).add(args['session_id'])
+            scoped_calls = {call_id for call_id, scopes in owners.items() if scopes == {scope}}
         result = []
         for item in items:
             entry = self.calls.get((scope, item.get('call_id'))) if isinstance(item, dict) else None
-            if (entry and item.get('item_type') == 'FunctionCallOutputItem' and
+            if (entry and (not shared or item.get('call_id') in scoped_calls) and item.get('item_type') == 'FunctionCallOutputItem' and
                     item.get('tool_name') == 'reply' and item.get('success') is True):
                 count, mode, _ = entry
                 output = item.get('output')

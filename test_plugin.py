@@ -54,6 +54,25 @@ class PluginTests(IsolatedAsyncioTestCase):
         self.assertEqual(await self.p.voice_reply_extension(phase='prepare'), {})
         self.p._render.assert_not_called()
 
+    async def test_shared_planner_hook_preserves_scope_schema_and_only_hides_owned_voice(self):
+        from test_history_visibility import item
+        definitions = [{'type': 'function', 'function': {'name': 'reply', 'parameters': {
+            'required': ['session_id'], 'properties': {'session_id': {'type': 'string', 'enum': ['a', 'b']}}}}}]
+        self.p._visibility.ids[('a', 'own')] = self.p._visibility.clock() + 100
+        own = item('own', chat='a')
+        other = item('own', chat='b')
+        source = [own, other]
+        self.assertIsNone(await self.p.hide_planner_voice(items=source))
+        result = await self.p.hide_planner_voice(items=source, session_id='', tool_definitions=definitions,
+                                                item_schema_version=1)
+        payload = result['modified_kwargs']
+        self.assertEqual(payload['items'], [other])
+        self.assertEqual(payload['tool_definitions'], definitions)
+        self.assertEqual(payload['session_id'], '')
+        self.assertEqual(payload['item_schema_version'], 1)
+        self.assertEqual(source, [own, other])
+        self.p._render.assert_not_called()
+
     async def test_selected_reply_preserves_everything(self):
         before = deepcopy(self.messages)
         result = await self.p.voice_reply_extension(phase='before_send', messages=self.messages,

@@ -18,10 +18,12 @@ try:
     from .audio import SpeechEngine, SpeechError, split_text, voice_message
     from .history_visibility import ReplyReceiptVisibility, VoiceVisibility
     from .deferred_speech import DeferredSpeech
+    from .focus_scope import planner_scopes
 except ImportError:
     from audio import SpeechEngine, SpeechError, split_text, voice_message
     from history_visibility import ReplyReceiptVisibility, VoiceVisibility
     from deferred_speech import DeferredSpeech
+    from focus_scope import planner_scopes
 
 
 class PluginSection(PluginConfigBase):
@@ -344,7 +346,15 @@ class NekoTTS(MaiBotPlugin):
     @HookHandler('maisaka.planner.before_request', name='neko_tts_hide_planner_voice',
                  mode=HookMode.BLOCKING, order=HookOrder.LATE, error_policy=ErrorPolicy.SKIP)
     async def hide_planner_voice(self, items=None, session_id='', **kwargs):
-        return self._visible_prompt(items, session_id, kwargs)
+        if session_id:
+            return self._visible_prompt(items, session_id, kwargs)
+        kept = items
+        for scope in planner_scopes('', kwargs.get('tool_definitions')):
+            kept = self._visibility.filter_items(kept, scope, shared=True)
+            kept = self._reply_visibility.filter_items(kept, scope, shared=True)
+        if kept is items or kept == items:
+            return None
+        return {'action': 'continue', 'modified_kwargs': dict(kwargs, items=kept, session_id=session_id)}
 
     @HookHandler('maisaka.replyer.before_model_request', name='neko_tts_hide_replyer_voice',
                  mode=HookMode.BLOCKING, order=HookOrder.LATE, error_policy=ErrorPolicy.SKIP)
