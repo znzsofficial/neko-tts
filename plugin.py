@@ -89,6 +89,8 @@ class NekoTTS(MaiBotPlugin):
     def __init__(self):
         super().__init__()
         self._engine = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._unloaded = False
         self._tasks = set()
         self._generation = 0
         self._ready = False
@@ -99,6 +101,11 @@ class NekoTTS(MaiBotPlugin):
         self._reply_visibility = ReplyReceiptVisibility()
 
     async def on_load(self):
+        async with self._lifecycle_lock:
+            self._unloaded = False
+            self._load_locked()
+
+    def _load_locked(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
         self._visibility = VoiceVisibility(Path(self.ctx.paths.data_dir) / 'voice-receipts.json')
         self._reply_visibility = ReplyReceiptVisibility(Path(self.ctx.paths.data_dir) / 'reply-receipts.json')
@@ -114,6 +121,12 @@ class NekoTTS(MaiBotPlugin):
         self.ctx.logger.info("Neko TTS 已加载：固定提示；mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
     async def _reset(self):
+        async with self._lifecycle_lock:
+            await self._reset_locked()
+
+    async def _reset_locked(self):
+        # Caller owns the lifecycle lock. Do not reacquire it from callbacks;
+        # render/worker tasks never acquire it, so cancellation can drain them.
         self._ready = False
         self._generation += 1
         tasks = list(self._tasks)
@@ -123,20 +136,27 @@ class NekoTTS(MaiBotPlugin):
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._engine:
             await self._engine.close()
+            self._engine = None
         self._deferred = DeferredSpeech()
         self._voice_queue = asyncio.Queue(maxsize=8)
         self._voice_worker = None
         self._visibility.pending.clear()
 
     async def on_unload(self):
-        await self._reset()
+        async with self._lifecycle_lock:
+            self._unloaded = True
+            await self._reset_locked()
 
     async def on_config_update(self, scope, config_data, version):
         if scope == CONFIG_RELOAD_SCOPE_SELF:
-            await self._reset()
-            self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
-            self._ready = True
-            self.ctx.logger.info("Neko TTS 配置已更新：mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
+            async with self._lifecycle_lock:
+                # A previously dispatched RPC may reach us after unload.
+                if self._unloaded:
+                    return
+                await self._reset_locked()
+                self._engine = SpeechEngine(self.ctx.paths.runtime_dir)
+                self._ready = True
+                self.ctx.logger.info("Neko TTS 配置已更新：mode=%s probability=%.2f", self.config.trigger.mode, self.config.trigger.probability)
 
     async def _render(self, text):
         if not self._ready or not self.config.plugin.enabled:

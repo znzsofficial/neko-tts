@@ -229,3 +229,124 @@ class LifecycleTests(IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await caller
         self.p.ctx.send.custom.assert_awaited_once()
+
+    def block_engine_close(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        old = self.p._engine
+
+        async def close():
+            entered.set()
+            await release.wait()
+
+        old.close.side_effect = close
+        return old, entered, release
+
+    async def test_overlapping_updates_close_each_generation_once_without_leaking_engine(self):
+        old, entered, release = self.block_engine_close()
+        engines = [SimpleNamespace(render=AsyncMock(return_value=pcm_wav()), close=AsyncMock())
+                   for _ in range(2)]
+        config_before = self.p.config.model_dump()
+        with patch('plugin.SpeechEngine', side_effect=engines) as factory:
+            first = asyncio.create_task(self.p.on_config_update('self', {}, 1))
+            await asyncio.wait_for(entered.wait(), 1)
+            second = asyncio.create_task(self.p.on_config_update('self', {}, 2))
+            try:
+                await asyncio.sleep(0)
+                self.assertEqual(old.close.await_count, 1)
+                factory.assert_not_called()
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.gather(first, second), 1)
+        old.close.assert_awaited_once()
+        engines[0].close.assert_awaited_once()
+        engines[1].close.assert_not_awaited()
+        self.assertIs(self.p._engine, engines[1])
+        self.assertTrue(self.p._ready)
+        self.assertEqual(self.p.config.model_dump(), config_before)
+        await self.p.on_unload()
+        engines[1].close.assert_awaited_once()
+
+    async def test_unload_between_updates_cannot_resurrect_old_instance(self):
+        old, entered, release = self.block_engine_close()
+        replacement = SimpleNamespace(close=AsyncMock())
+        with patch('plugin.SpeechEngine', return_value=replacement) as factory:
+            first = asyncio.create_task(self.p.on_config_update('self', {}, 1))
+            await asyncio.wait_for(entered.wait(), 1)
+            unload = asyncio.create_task(self.p.on_unload())
+            late = asyncio.create_task(self.p.on_config_update('self', {}, 2))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(first, unload, late), 1)
+            factory.assert_called_once()
+        old.close.assert_awaited_once()
+        replacement.close.assert_awaited_once()
+        self.assertIsNone(self.p._engine)
+        self.assertFalse(self.p._ready)
+        self.p.ctx.send.custom.assert_not_awaited()
+
+    async def test_update_waiting_on_unload_never_creates_an_engine(self):
+        old, entered, release = self.block_engine_close()
+        with patch('plugin.SpeechEngine', return_value=SimpleNamespace(close=AsyncMock())) as factory:
+            unload = asyncio.create_task(self.p.on_unload())
+            await asyncio.wait_for(entered.wait(), 1)
+            update = asyncio.create_task(self.p.on_config_update('self', {}, 1))
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(unload, update), 1)
+            await self.p.on_config_update('self', {}, 2)
+            factory.assert_not_called()
+        old.close.assert_awaited_once()
+        self.assertFalse(self.p._ready)
+
+    async def test_direct_reset_serializes_with_update_without_recursive_lock_deadlock(self):
+        old, entered, release = self.block_engine_close()
+        replacement = SimpleNamespace(close=AsyncMock())
+        with patch('plugin.SpeechEngine', return_value=replacement):
+            update = asyncio.create_task(self.p.on_config_update('self', {}, 1))
+            await asyncio.wait_for(entered.wait(), 1)
+            reset = asyncio.create_task(self.p._reset())
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.wait_for(asyncio.gather(update, reset), 1)
+        old.close.assert_awaited_once()
+        replacement.close.assert_awaited_once()
+        self.assertIsNone(self.p._engine)
+        self.assertFalse(self.p._ready)
+
+    async def test_cancelling_waiting_update_does_not_interrupt_reset_owner(self):
+        old, entered, release = self.block_engine_close()
+        with patch('plugin.SpeechEngine', return_value=SimpleNamespace(close=AsyncMock())) as factory:
+            reset = asyncio.create_task(self.p._reset())
+            await asyncio.wait_for(entered.wait(), 1)
+            waiter = asyncio.create_task(self.p.on_config_update('self', {}, 1))
+            await asyncio.sleep(0)
+            waiter.cancel()
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await waiter
+                self.assertFalse(reset.done())
+            finally:
+                release.set()
+                await asyncio.wait_for(reset, 1)
+            factory.assert_not_called()
+        old.close.assert_awaited_once()
+        self.assertIsNone(self.p._engine)
+
+    async def test_cancelled_update_propagates_and_next_update_can_finish_cleanup(self):
+        old, entered, release = self.block_engine_close()
+        replacement = SimpleNamespace(close=AsyncMock())
+        with patch('plugin.SpeechEngine', return_value=replacement) as factory:
+            update = asyncio.create_task(self.p.on_config_update('self', {}, 1))
+            await asyncio.wait_for(entered.wait(), 1)
+            update.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await update
+            factory.assert_not_called()
+            self.assertFalse(self.p._ready)
+            self.assertIs(self.p._engine, old)  # Retain ownership until close completes.
+            release.set()
+            await asyncio.wait_for(self.p.on_config_update('self', {}, 2), 1)
+            factory.assert_called_once()
+        self.assertEqual(old.close.await_count, 2)  # Interrupted close is retried, not leaked.
+        self.assertIs(self.p._engine, replacement)
+        self.assertTrue(self.p._ready)
