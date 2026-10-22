@@ -46,9 +46,15 @@ SDK 精确分发依据：[PyPI 2.16.0 JSON](https://pypi.org/pypi/maibot-plugin-
 
 - 实例单个 `_lifecycle_lock` 统一保护 load、self update、unload 和直接 `_reset`。锁内 helper 不重复获取锁；render / 后台 worker 不获取此锁，reset 可取消并等待它们退出，不引入锁反转。
 - update 的 reset 与新 engine 创建在同一临界区；成功 close 后清空旧指针，避免重复关闭已结束的 engine。关闭中遭外部取消则保留旧指针与 not-ready 状态，下次生命周期可继续清理，取消不被吞掉。
-- unload 标记阻止已排队/迟到的配置回调复活旧实例；显式 on_load 仍允许宿主重新激活实例。
+- unload 标记阻止已排队/迟到的配置回调复活旧实例；显式 on_load 仅在残余engine清理及加载成功后允许重新激活实例。失败卸载后同实例再load属于防守性条件场景，未核实生产确有此复用路径；重试关闭失败/外部取消时保留旧engine所有权及not-ready，不覆盖未关闭指针。
 - 六项新增回归：双配置更新、更新/卸载/迟到更新、卸载后更新、直接 reset 竞争/非递归锁、等待锁时外部取消、持锁 close 时外部取消及后续清理。现有 render/后台 worker/期限/外部取消回归保留。
 - 将四项核心竞争回归对 `git show 50e65a1:plugin.py` 在内存执行：**4项均预期失败、0 error**（重复关闭、重复创建/卸载后复活）；当前实现全部通过。
 - Windows/Python3.12：真实 SDK2.12 全套 **120通过、0 skip**；官方校验过的 SDK2.16 wheel 临时隔离导入同样 **120通过、0 skip**，未修改原 venv 依赖。
 - `scripts/package.py`：10文件白名单打包/解压后真实 SDK2.12 导入成功。此审计文档和测试不进入发布ZIP。
 - 不变：配置值/模型/发送模式/概率/音色/权限/Focus；未发模型/QQ请求，未访问或变更生产，未 push/deploy。源码可达性与合成并发回归不冒称生产端到端验收。
+
+### 追加同实例load防守回归
+
+新增4项覆盖失败unload后重试load成功、close再次失败、close外部取消，以及首次load/成功unload后再次load。保持锁内helper，关闭失败不创建替代engine、不解除unloaded标记，外部取消直接传播。前述120项是上一轮基线，本轮门禁提升至124项；不增加生产复用已发生的承诺。
+
+本地SDK2.12与隔离SDK2.16各124项通过、0 skip，10文件白名单package/解压导入通过。两个残余engine核心回归对c83ac7c源码运行均预期失败、0 error。追加修复仅本地提交，不push/deploy，不改生产配置。

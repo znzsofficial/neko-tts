@@ -102,8 +102,13 @@ class NekoTTS(MaiBotPlugin):
 
     async def on_load(self):
         async with self._lifecycle_lock:
-            self._unloaded = False
+            self._ready = False
+            # A failed/cancelled unload may still own an unclosed engine.
+            # Finish that cleanup before constructing a replacement.
+            if self._engine is not None:
+                await self._reset_locked()
             self._load_locked()
+            self._unloaded = False
 
     def _load_locked(self):
         self._engine = SpeechEngine(self.ctx.paths.runtime_dir)

@@ -6,6 +6,7 @@ entry. Runner _handle_invoke catches Exception, not CancelledError. The small
 harness below models that boundary, not a running host/QQ or a delivery claim.
 """
 import asyncio
+import tempfile
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
@@ -350,3 +351,80 @@ class LifecycleTests(IsolatedAsyncioTestCase):
         self.assertEqual(old.close.await_count, 2)  # Interrupted close is retried, not leaked.
         self.assertIs(self.p._engine, replacement)
         self.assertTrue(self.p._ready)
+
+    async def test_failed_unload_then_same_instance_load_closes_residual_engine_first(self):
+        old = self.p._engine
+        old.close.side_effect = [RuntimeError('close failed'), None]
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            await self.p.on_unload()
+        self.assertIs(self.p._engine, old)
+        replacement = SimpleNamespace(close=AsyncMock())
+
+        def create_engine(_):
+            self.assertEqual(old.close.await_count, 2)
+            self.assertIsNone(self.p._engine)
+            return replacement
+
+        with tempfile.TemporaryDirectory() as directory:
+            self.p.ctx.paths.data_dir = directory
+            self.p.ctx.paths.runtime_dir = directory
+            with patch('plugin.SpeechEngine', side_effect=create_engine):
+                await asyncio.wait_for(self.p.on_load(), 1)
+        self.assertIs(self.p._engine, replacement)
+        self.assertTrue(self.p._ready)
+        self.assertFalse(self.p._unloaded)
+
+    async def test_same_instance_load_close_failure_keeps_not_ready_and_engine_ownership(self):
+        old = self.p._engine
+        old.close.side_effect = RuntimeError('close failed')
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            await self.p.on_unload()
+        try:
+            with patch('plugin.SpeechEngine', side_effect=AssertionError('unclosed engine replaced')) as factory:
+                with self.assertRaisesRegex(RuntimeError, 'close failed'):
+                    await asyncio.wait_for(self.p.on_load(), 1)
+                factory.assert_not_called()
+        finally:
+            old.close.side_effect = None  # Allow tearDown to retry cleanup.
+        self.assertEqual(old.close.await_count, 2)
+        self.assertIs(self.p._engine, old)
+        self.assertFalse(self.p._ready)
+        self.assertTrue(self.p._unloaded)
+
+    async def test_same_instance_load_close_cancellation_propagates_without_replacement(self):
+        old = self.p._engine
+        old.close.side_effect = RuntimeError('close failed')
+        with self.assertRaisesRegex(RuntimeError, 'close failed'):
+            await self.p.on_unload()
+        old, entered, release = self.block_engine_close()
+        with patch('plugin.SpeechEngine') as factory:
+            load = asyncio.create_task(self.p.on_load())
+            await asyncio.wait_for(entered.wait(), 1)
+            load.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await load
+            factory.assert_not_called()
+        self.assertIs(self.p._engine, old)
+        self.assertFalse(self.p._ready)
+        self.assertTrue(self.p._unloaded)
+        self.assertFalse(self.p._lifecycle_lock.locked())
+        release.set()
+
+    async def test_first_load_and_load_after_successful_unload_remain_supported(self):
+        await self.p._reset()
+        engines = [SimpleNamespace(close=AsyncMock()), SimpleNamespace(close=AsyncMock())]
+        with tempfile.TemporaryDirectory() as directory:
+            self.p.ctx.paths.data_dir = directory
+            self.p.ctx.paths.runtime_dir = directory
+            with patch('plugin.SpeechEngine', side_effect=engines) as factory:
+                await asyncio.wait_for(self.p.on_load(), 1)
+                self.assertTrue(self.p._ready)
+                self.assertIs(self.p._engine, engines[0])
+                await self.p.on_unload()
+                engines[0].close.assert_awaited_once()
+                self.assertIsNone(self.p._engine)
+                await asyncio.wait_for(self.p.on_load(), 1)
+                self.assertEqual(factory.call_count, 2)
+        self.assertIs(self.p._engine, engines[1])
+        self.assertTrue(self.p._ready)
+        self.assertFalse(self.p._unloaded)
