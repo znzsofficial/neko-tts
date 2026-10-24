@@ -105,10 +105,11 @@ python scripts/package.py --output neko-tts.zip
 
 测试覆盖真实 SDK 导入、混合触发/主动优先/避免重复/其他工具不变、回复扩展失败回退、命令鉴权、分段保真、固定提示原样发送、模拟 MiMo HTTP、限流退避、缺失音频恢复和重试上限，以及实际 FFmpeg 参考选取和合并。无系统 FFmpeg 时可在测试命令加 `--with imageio-ffmpeg`。
 
-GitHub Actions 在 Ubuntu/Windows × Python 3.12/3.14 × SDK `==2.10.0`/`==2.12.0`/`>=2.12,<3` 共12档运行，
+日常源码CI用Linux生产Python3.14.4/SDK2.16.0与Windows最低Python3.12/SDK2.10两组；原Ubuntu/Windows × Python3.12/3.14 × SDK2.10/2.12/最新共12组兼容保留在v标签、手动full及有源码变化的夜间验证，另保留固定生产组合。
 额外保留manifest声明的2.10最低支持档。PyPI包名`maibot-plugin-sdk`，导入名`maibot_sdk`。
-门禁要求至少114项、0 skip、0失败；缺真实SDK、缺FFmpeg导致关键测试跳过均失败。
+门禁要求音频/回执/生命周期/共享Focus/历史可见性/打包等关键测试组非空并实际成功，0 skip、0失败，不以固定总用例数证明正确；缺真实SDK、缺FFmpeg导致关键测试跳过均失败。
 CI显式装`imageio-ffmpeg`作为真实FFmpeg备用（测试优先系统PATH，否则使用其二进制）、`tzdata`统一Windows时区依赖。
+纯根目录/docs下Markdown只查本地文档，不能作为源码发布证明。源码仍须同main提交、核心测试/最终包实际通过及ci-gate/publish-gate成功；受控手动同HEAD核心验证可用于文档HEAD发版，不做空提交。CI不自动部署或发模型/QQ。
 FFmpeg测试仅使用临时目录生成的合成音频，不扫描真实参考音频目录；HTTP测试仅本机假服务/Mock，不调用MiMo、付费模型或QQ。
 新增未知结果回归确认供应商响应超时不重新请求、命令投递超时不重发、后台已消耗匹配记录不因重复回执重发。
 0.7.3新增真实合成PCM WAV残留错误/结束原因兼容回归、真实`_render`并发换代、部分音频准备后换代、调用方取消/期限、卸载active拒绝、后台worker撤销不重放，以及命令分阶段诊断；本地Python3.12/SDK2.12下114项零skip（含既有本机假HTTP与实际FFmpeg测试），未请求真实模型/QQ或生产网络。
